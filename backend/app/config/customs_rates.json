@@ -1,0 +1,11 @@
+{
+  "_comment": "Taux par defaut, modifiables depuis l'interface (Reglages > Douane). duty_rate et vat_rate sont des fractions (0.20 = 20%). Ce sont des valeurs indicatives generalistes a verifier/ajuster selon le code SH exact de chaque article (a confirmer sur le simulateur officiel des douanes francaises / RITA).",
+  "default": { "label": "Categorie generique", "duty_rate": 0.025, "vat_rate": 0.20 },
+  "toys_figures": { "label": "Jouets, figurines, goodies", "duty_rate": 0.0, "vat_rate": 0.20 },
+  "trading_cards": { "label": "Cartes a collectionner", "duty_rate": 0.0, "vat_rate": 0.20 },
+  "clothing": { "label": "Vetements, textile", "duty_rate": 0.12, "vat_rate": 0.20 },
+  "electronics": { "label": "Electronique / accessoires", "duty_rate": 0.03, "vat_rate": 0.20 },
+  "books_manga": { "label": "Livres, manga", "duty_rate": 0.0, "vat_rate": 0.055 },
+  "jewelry": { "label": "Bijoux, accessoires mode", "duty_rate": 0.025, "vat_rate": 0.20 },
+  "cosmetics": { "label": "Cosmetiques", "duty_rate": 0.0, "vat_rate": 0.20 }
+}
