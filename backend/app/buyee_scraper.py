@@ -63,40 +63,39 @@ logger = logging.getLogger("buyee_scraper")
 
 BUYEE_BASE_URL = "https://buyee.jp"
 
-# --- Login: best-effort, NOT verified against a real login page (see notice
-# above). CONFIRMED WRONG on 2026-09-18 against a real account (Render logs
-# showed "Page.fill: Timeout 30000ms exceeded -- waiting for
-# locator(input[name='login_id'])"), so several likely alternatives are now
-# tried in turn, each with a short timeout, instead of a single 30s guess.
-# Adjust/extend these lists if login still fails. ---------------------------
+# --- Login: CONFIRMED against a real, logged-out Buyee login page
+# (https://buyee.jp/signup/login) on 2026-09-18. The form has id
+# "login_form" and posts to /signup/login, but the "Login" button is NOT a
+# <button>/<input type=submit> -- it's a plain <a id="login_submit"
+# href="javascript:void(0);">, presumably wired up by JS to first fill a
+# hidden "login[fingerprintData]" field (a browser-fingerprint anti-bot
+# check) before actually submitting. Because that only runs client-side, we
+# still click the real element (via Playwright, a real browser) rather than
+# submitting the form ourselves, so that JS handler fires normally.
 BUYEE_LOGIN_URL = f"{BUYEE_BASE_URL}/signup/login"
 LOGIN_SELECTORS = {
-    # Kept for backward compatibility / documentation of the first guess;
-    # the actual login now tries USERNAME_FIELD_CANDIDATES etc. below.
-    "username_field": "input[name='login_id']",
-    "password_field": "input[name='password']",
-    "submit_button": "button[type='submit']",
+    # Kept for backward compatibility / documentation; the actual login now
+    # tries USERNAME_FIELD_CANDIDATES etc. below (confirmed selector first).
+    "username_field": "input#login_mailAddress",
+    "password_field": "input#login_password",
+    "submit_button": "#login_submit",
 }
 USERNAME_FIELD_CANDIDATES = [
+    "input#login_mailAddress",
+    "input[name='login[mailAddress]']",
     "input[name='login_id']",
-    "input#login_id",
-    "input[name='loginId']",
-    "input[name='email']",
     "input[type='email']",
-    "input[name='username']",
-    "input[name='mail']",
-    "input#mail",
 ]
 PASSWORD_FIELD_CANDIDATES = [
-    "input[name='password']",
-    "input#password",
+    "input#login_password",
+    "input[name='login[password]']",
     "input[type='password']",
 ]
 SUBMIT_BUTTON_CANDIDATES = [
+    "#login_submit",
+    "a#login_submit",
     "button[type='submit']",
     "input[type='submit']",
-    "button.g-button",
-    "button.login-button",
 ]
 FIELD_TRY_TIMEOUT_MS = 4000
 
@@ -329,7 +328,7 @@ def _login_looks_successful(html: str) -> bool:
     return True  # give the benefit of the doubt; the baggages page check below is authoritative
 
 
-def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 10) -> ScrapeResult:
+def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeResult:
     """Logs into Buyee and pulls recent shipped packages: article name,
     photo, item price, Japan domestic shipping AND the real international
     (Japan -> France) shipping fee Buyee already charged, for each line
@@ -407,7 +406,16 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 10) -> Scrape
     # now (proven to run in this image); revisit stealth mode -- and bump
     # the Dockerfile's playwright/python base image tag to match -- only if
     # the diagnostics below actually point to bot detection.
-    with DynamicSession(headless=True, network_idle=True) as session:
+    # disable_resources=True stops the browser from downloading images,
+    # fonts, stylesheets and media (it still runs all JavaScript, which is
+    # what actually renders the Knockout.js price/photo data we need) --
+    # this was added after Render's own memory metrics showed the process
+    # climbing from ~58MB to ~536MB (the instance's 512MB limit) during a
+    # real import and getting OOM-killed mid-request, which is what showed
+    # up in the app as "Failed to fetch". We only ever read the *URL*
+    # string out of each <img src="..."> attribute, never the decoded
+    # image itself, so not fetching the actual image bytes costs nothing.
+    with DynamicSession(headless=True, network_idle=True, disable_resources=True) as session:
         login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
         warnings.append(
             f"[diagnostic] Selecteurs de connexion utilises : "
