@@ -64,13 +64,41 @@ logger = logging.getLogger("buyee_scraper")
 BUYEE_BASE_URL = "https://buyee.jp"
 
 # --- Login: best-effort, NOT verified against a real login page (see notice
-# above). Adjust here if the login step fails. ---------------------------
+# above). CONFIRMED WRONG on 2026-09-18 against a real account (Render logs
+# showed "Page.fill: Timeout 30000ms exceeded -- waiting for
+# locator(input[name='login_id'])"), so several likely alternatives are now
+# tried in turn, each with a short timeout, instead of a single 30s guess.
+# Adjust/extend these lists if login still fails. ---------------------------
 BUYEE_LOGIN_URL = f"{BUYEE_BASE_URL}/signup/login"
 LOGIN_SELECTORS = {
+    # Kept for backward compatibility / documentation of the first guess;
+    # the actual login now tries USERNAME_FIELD_CANDIDATES etc. below.
     "username_field": "input[name='login_id']",
     "password_field": "input[name='password']",
     "submit_button": "button[type='submit']",
 }
+USERNAME_FIELD_CANDIDATES = [
+    "input[name='login_id']",
+    "input#login_id",
+    "input[name='loginId']",
+    "input[name='email']",
+    "input[type='email']",
+    "input[name='username']",
+    "input[name='mail']",
+    "input#mail",
+]
+PASSWORD_FIELD_CANDIDATES = [
+    "input[name='password']",
+    "input#password",
+    "input[type='password']",
+]
+SUBMIT_BUTTON_CANDIDATES = [
+    "button[type='submit']",
+    "input[type='submit']",
+    "button.g-button",
+    "button.login-button",
+]
+FIELD_TRY_TIMEOUT_MS = 4000
 
 # --- "Colis expedies" list: CONFIRMED against a real account. ------------
 BUYEE_BAGGAGES_URL_TEMPLATE = BUYEE_BASE_URL + "/mybaggages/shipped/{page}"
@@ -301,7 +329,7 @@ def _login_looks_successful(html: str) -> bool:
     return True  # give the benefit of the doubt; the baggages page check below is authoritative
 
 
-def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> ScrapeResult:
+def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 10) -> ScrapeResult:
     """Logs into Buyee and pulls recent shipped packages: article name,
     photo, item price, Japan domestic shipping AND the real international
     (Japan -> France) shipping fee Buyee already charged, for each line
@@ -324,13 +352,52 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
             "pip install \"scrapling[fetchers]\" && scrapling install"
         ) from exc
 
+    login_debug: dict = {"username_selector": None, "password_selector": None, "submit_selector": None, "error": None}
+
+    def _fill_first_match(page, candidates: list[str], value: str) -> str | None:
+        for sel in candidates:
+            try:
+                page.fill(sel, value, timeout=FIELD_TRY_TIMEOUT_MS)
+                return sel
+            except Exception:  # noqa: BLE001 - just try the next candidate
+                continue
+        return None
+
+    def _click_first_match(page, candidates: list[str]) -> str | None:
+        for sel in candidates:
+            try:
+                page.click(sel, timeout=FIELD_TRY_TIMEOUT_MS)
+                return sel
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
     def _do_login(page):
         """Runs inside Scrapling's browser via page_action: receives the
-        real Playwright Page object to fill and submit the login form."""
-        page.fill(LOGIN_SELECTORS["username_field"], credentials.username)
-        page.fill(LOGIN_SELECTORS["password_field"], credentials.password)
-        page.click(LOGIN_SELECTORS["submit_button"])
-        page.wait_for_load_state("networkidle")
+        real Playwright Page object to fill and submit the login form.
+        Tries several likely selectors quickly (a few seconds each) instead
+        of betting everything on one guess for 30s, and records which ones
+        worked (or that none did) in login_debug for the warnings below."""
+        login_debug["username_selector"] = _fill_first_match(
+            page, USERNAME_FIELD_CANDIDATES, credentials.username
+        )
+        if not login_debug["username_selector"]:
+            login_debug["error"] = "champ identifiant introuvable"
+            return
+        login_debug["password_selector"] = _fill_first_match(
+            page, PASSWORD_FIELD_CANDIDATES, credentials.password
+        )
+        if not login_debug["password_selector"]:
+            login_debug["error"] = "champ mot de passe introuvable"
+            return
+        login_debug["submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+        if not login_debug["submit_selector"]:
+            login_debug["error"] = "bouton de connexion introuvable"
+            return
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:  # noqa: BLE001 - not fatal, we check the resulting page below anyway
+            pass
 
     # NOTE: Scrapling's StealthySession (a stealth/"patchright" browser that
     # can look more like a normal Chrome tab and push through Cloudflare)
@@ -342,14 +409,37 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
     # the diagnostics below actually point to bot detection.
     with DynamicSession(headless=True, network_idle=True) as session:
         login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
+        warnings.append(
+            f"[diagnostic] Selecteurs de connexion utilises : "
+            f"identifiant={login_debug['username_selector']!r}, "
+            f"mot_de_passe={login_debug['password_selector']!r}, "
+            f"bouton={login_debug['submit_selector']!r}"
+        )
         warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
-        if not _login_looks_successful(str(login_result.html_content)):
+
+        login_ok = not login_debug["error"] and _login_looks_successful(str(login_result.html_content))
+        if login_debug["error"]:
+            warnings.append(
+                f"La connexion a Buyee a echoue avant meme d'envoyer le formulaire : "
+                f"{login_debug['error']}. Il faut ajuster les selecteurs de connexion "
+                f"dans buyee_scraper.py (USERNAME_FIELD_CANDIDATES / "
+                f"PASSWORD_FIELD_CANDIDATES / SUBMIT_BUTTON_CANDIDATES) -- envoie le HTML "
+                f"de https://buyee.jp/signup/login (deconnectee) pour que je trouve les bons."
+            )
+        elif not login_ok:
             warnings.append(
                 "La connexion a Buyee semble avoir echoue (toujours sur une page de "
                 "connexion apres l'envoi du formulaire) -- verifie tes identifiants, "
-                "ou verifie LOGIN_SELECTORS dans buyee_scraper.py si tes identifiants "
-                "sont pourtant corrects."
+                "ou envoie le HTML de https://buyee.jp/signup/login (deconnectee) pour "
+                "que je verifie les selecteurs."
             )
+
+        if not login_ok:
+            # Don't burn several more minutes (and risk the request timing
+            # out entirely, which shows up in the app as a generic "Failed
+            # to fetch") trying to scrape a page we know we're not logged
+            # into.
+            return ScrapeResult(articles=[], warnings=warnings)
 
         raw_items: list[dict] = []
         page_num = 1
