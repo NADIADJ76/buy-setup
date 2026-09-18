@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import traceback
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
@@ -8,6 +11,8 @@ from ..customs import compute_cost_breakdown
 from ..models import Article, CostInputs
 from ..product_sheet import generate_product_sheet_pdf
 from ..whatnot_strategy import compute_whatnot_strategy
+
+logger = logging.getLogger("buy_setup")
 
 router = APIRouter(prefix="/sheet", tags=["sheet"])
 
@@ -19,10 +24,14 @@ def generate_sheet(article_id: str, inputs: CostInputs):
         raise HTTPException(status_code=404, detail="Article introuvable")
     article = Article(**article_dict)
 
-    cost = compute_cost_breakdown(inputs)
-    strategy = compute_whatnot_strategy(article_id, cost.total_landed_cost_eur)
+    try:
+        cost = compute_cost_breakdown(inputs)
+        strategy = compute_whatnot_strategy(article_id, cost.total_landed_cost_eur)
+        pdf_path = generate_product_sheet_pdf(article, cost, strategy)
+    except Exception as exc:
+        logger.error("Echec de generation de la fiche PDF:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la generation de la fiche : {exc}")
 
-    pdf_path = generate_product_sheet_pdf(article, cost, strategy)
     return {"pdf_path": str(pdf_path), "download_url": f"/sheet/{article_id}/download"}
 
 

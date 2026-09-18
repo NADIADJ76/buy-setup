@@ -92,17 +92,18 @@ def fetch_invoices(credentials: BuyeeCredentials, max_orders: int = 20) -> Scrap
             "pip install \"scrapling[fetchers]\" && scrapling install"
         ) from exc
 
-    with DynamicSession(headless=True, network_idle=True) as session:
-        login_page = session.fetch(BUYEE_LOGIN_URL)
-
-        # Fill and submit the login form. Scrapling's DynamicSession exposes
-        # the underlying Playwright page for direct interaction when a CSS
-        # selector-only fetch isn't enough (form fill + click).
-        page = login_page.page  # underlying Playwright Page, per Scrapling docs
+    def _do_login(page):
+        """Runs inside Scrapling's browser via page_action: receives the real
+        Playwright Page object to fill and submit the login form."""
         page.fill(LOGIN_SELECTORS["username_field"], credentials.username)
         page.fill(LOGIN_SELECTORS["password_field"], credentials.password)
         page.click(LOGIN_SELECTORS["submit_button"])
         page.wait_for_load_state("networkidle")
+
+    with DynamicSession(headless=True, network_idle=True) as session:
+        # page_action runs our login callback against the real browser page
+        # right after navigation, before Scrapling hands back the parsed result.
+        session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
 
         order_list_page = session.fetch(BUYEE_ORDER_HISTORY_URL)
         order_rows = order_list_page.css(ORDER_LIST_SELECTORS["order_row"])
