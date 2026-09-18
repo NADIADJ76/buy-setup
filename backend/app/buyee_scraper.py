@@ -275,6 +275,20 @@ def _fetch_item_details(session, fiche_url: str) -> dict:
     return details
 
 
+def _page_diagnostic(resp) -> str:
+    """A short 'where did we actually end up' string (URL + title) used to
+    tell apart, from the warnings shown in the app, whether a failed import
+    is a login problem, a bot-detection/redirect problem, or a genuinely
+    empty account -- without needing another round-trip of HTML files."""
+    try:
+        soup = BeautifulSoup(str(resp.html_content), "html.parser")
+        title = soup.title.get_text(strip=True) if soup.title else "(sans titre)"
+    except Exception:  # noqa: BLE001
+        title = "(titre illisible)"
+    url = getattr(resp, "url", "(url inconnue)")
+    return f"URL={url} | titre={title}"
+
+
 def _login_looks_successful(html: str) -> bool:
     """Heuristic check that the login actually worked, so a bad selector or
     a wrong/expired password produces a clear warning instead of silently
@@ -303,7 +317,7 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
     articles: list[Article] = []
 
     try:
-        from scrapling.fetchers import DynamicSession
+        from scrapling.fetchers import StealthySession
     except ImportError as exc:  # pragma: no cover - dependency install issue
         raise RuntimeError(
             "Scrapling n'est pas installe correctement. Lance : "
@@ -318,8 +332,14 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
         page.click(LOGIN_SELECTORS["submit_button"])
         page.wait_for_load_state("networkidle")
 
-    with DynamicSession(headless=True, network_idle=True) as session:
+    # StealthySession (rather than the plain DynamicSession used before)
+    # makes the headless browser look more like a normal Chrome tab
+    # (fingerprint, timing, etc.) and can push through a Cloudflare
+    # interstitial -- worth trying since Buyee may otherwise treat a
+    # cloud-hosted headless login as suspicious and quietly refuse it.
+    with StealthySession(headless=True, network_idle=True, solve_cloudflare=True) as session:
         login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
+        warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
         if not _login_looks_successful(str(login_result.html_content)):
             warnings.append(
                 "La connexion a Buyee semble avoir echoue (toujours sur une page de "
@@ -337,6 +357,7 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
             packages = soup.find_all("li", class_="luggageInfo")
             if not packages:
                 if page_num == 1:
+                    warnings.append(f"[diagnostic] Page colis : {_page_diagnostic(resp)}")
                     warnings.append(
                         "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
                         "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
