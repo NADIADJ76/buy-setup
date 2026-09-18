@@ -317,7 +317,7 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
     articles: list[Article] = []
 
     try:
-        from scrapling.fetchers import StealthySession
+        from scrapling.fetchers import DynamicSession
     except ImportError as exc:  # pragma: no cover - dependency install issue
         raise RuntimeError(
             "Scrapling n'est pas installe correctement. Lance : "
@@ -332,12 +332,15 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> Scrape
         page.click(LOGIN_SELECTORS["submit_button"])
         page.wait_for_load_state("networkidle")
 
-    # StealthySession (rather than the plain DynamicSession used before)
-    # makes the headless browser look more like a normal Chrome tab
-    # (fingerprint, timing, etc.) and can push through a Cloudflare
-    # interstitial -- worth trying since Buyee may otherwise treat a
-    # cloud-hosted headless login as suspicious and quietly refuse it.
-    with StealthySession(headless=True, network_idle=True, solve_cloudflare=True) as session:
+    # NOTE: Scrapling's StealthySession (a stealth/"patchright" browser that
+    # can look more like a normal Chrome tab and push through Cloudflare)
+    # was tried here but needs a newer bundled Chromium than this Docker
+    # image ships -- it crashed with "Executable doesn't exist at
+    # /ms-playwright/chromium-1234/...". Sticking with DynamicSession for
+    # now (proven to run in this image); revisit stealth mode -- and bump
+    # the Dockerfile's playwright/python base image tag to match -- only if
+    # the diagnostics below actually point to bot detection.
+    with DynamicSession(headless=True, network_idle=True) as session:
         login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
         warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
         if not _login_looks_successful(str(login_result.html_content)):
