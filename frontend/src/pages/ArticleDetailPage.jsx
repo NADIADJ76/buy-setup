@@ -21,7 +21,18 @@ export default function ArticleDetailPage() {
   useEffect(() => {
     api.getArticle(id).then((a) => {
       setArticle(a)
-      setForm((f) => ({ ...f, category: a.category || 'default' }))
+      setForm((f) => ({
+        ...f,
+        category: a.category || 'default',
+        // Pre-remplit avec les vraies valeurs Buyee quand elles sont
+        // disponibles (colis deja expedie) -- reste modifiable.
+        international_shipping_eur:
+          a.international_shipping_eur != null ? a.international_shipping_eur : f.international_shipping_eur,
+        jpy_to_eur_rate:
+          a.buyee_price_eur && a.item_price_jpy
+            ? +(a.buyee_price_eur / a.item_price_jpy).toFixed(6)
+            : f.jpy_to_eur_rate,
+      }))
     })
     api.getCustomsRates().then(setRates)
   }, [id])
@@ -72,8 +83,18 @@ export default function ArticleDetailPage() {
             {article.photo_url && <img src={article.photo_url} alt={article.name} style={{ width: '100%', borderRadius: 8 }} />}
           </div>
           <div>
-            <p>Prix article : {article.item_price_jpy} JPY</p>
+            <p>Prix article : {article.item_price_jpy} JPY{article.buyee_price_eur ? ` (~${article.buyee_price_eur.toFixed(2)} EUR selon Buyee)` : ''}</p>
             <p>Livraison domestique Japon (Buyee) : {article.japan_domestic_shipping_jpy} JPY</p>
+            {article.international_shipping_jpy > 0 && (
+              <p>
+                Livraison internationale Japon -&gt; France (Buyee) : {article.international_shipping_jpy.toFixed(0)} JPY
+                {article.international_shipping_eur ? ` (~${article.international_shipping_eur.toFixed(2)} EUR)` : ''}
+                <br />
+                <small style={{ color: 'var(--muted)' }}>
+                  Repartie a parts egales si ton colis contenait plusieurs articles -- champ pre-rempli ci-dessous, modifiable.
+                </small>
+              </p>
+            )}
 
             <form onSubmit={handleCompute}>
               <label>Taux de change JPY -&gt; EUR (ex: 0.0062)</label>

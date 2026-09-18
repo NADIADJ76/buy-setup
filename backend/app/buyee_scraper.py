@@ -1,20 +1,44 @@
-"""Buyee.jp invoice/order scraper built on Scrapling.
+"""Buyee.jp invoice/order scraper built on Scrapling (browser automation +
+session/login) with BeautifulSoup as a complement for HTML parsing.
 
-IMPORTANT - read before using in production:
------------------------------------------------
-This module was written WITHOUT access to a live, logged-in Buyee account
-(Claude cannot log into your personal account). The overall flow -- open
-login page, submit credentials, then walk the order/invoice pages -- is
-correct for how Buyee works, but the exact CSS selectors below
-(LOGIN_SELECTORS / ORDER_LIST_SELECTORS / INVOICE_SELECTORS) are
-best-effort placeholders based on Buyee's typical page structure and WILL
-likely need small adjustments once you run this against your real account.
+Verified against a real, logged-in Buyee account on 2026-09-18
+-----------------------------------------------------------------
+Unlike the very first version of this file (which guessed at Buyee's page
+structure), the selectors below were confirmed against two real pages the
+user exported directly from their own account:
 
-How to fix a selector that doesn't match:
+1. "Colis expedies" (https://buyee.jp/mybaggages/shipped/{page}) -- the list
+   of packages Buyee has already shipped to France. Each package
+   (`li.luggageInfo`) contains:
+   - `table.luggageInfo_order`: one row per item/order in the package
+     (marketplace, order number, item name + link, "Fiche complete" link).
+   - `div.amount_info_container` (hidden in the DOM until the "Frais de
+     port" toggle is clicked, but already present -- no click needed): a
+     table of the Japan-domestic shipping fee per item (keyed by the same
+     id that appears at the end of the item's own URL), followed by a
+     `<dl>` with the package-level totals, including the REAL
+     international (Japan -> France) shipping fee Buyee actually charged,
+     sometimes together with Buyee's own EUR conversion of that total.
+   - `div.delivery_info_container` (same hidden-until-toggled pattern): the
+     shipping method (e.g. EMS) and the delivery address -- not currently
+     used for cost calculation but kept in mind for future use.
+2. "Fiche complete" (https://buyee.jp/myorders/.../details, one per
+   item/order): a Knockout.js-rendered page with `div.itemCard__item`
+   (photo + item name) and `div.g-priceDetails` (the price actually billed
+   for that item, plus Buyee's own EUR conversion when the account has
+   that feature enabled).
+
+The login URL/selectors below are still best-effort (Claude cannot log into
+your account to verify them), so `_login_looks_successful()` checks the
+post-login page and reports a clear warning instead of silently scraping an
+empty/login page if the credentials or the selectors are off.
+
+How to fix a selector that stops matching (Buyee redesigns its site from
+time to time):
 1. Log into buyee.jp yourself in a normal browser.
-2. Open devtools (F12) on the order history / invoice page.
-3. Right click the element you need (price, photo, shipping line) ->
-   "Inspect" -> right click the highlighted HTML -> "Copy selector".
+2. Open devtools (F12) on the page in question.
+3. Right click the element you need -> "Inspect" -> right click the
+   highlighted HTML -> "Copy selector".
 4. Paste that selector into the matching entry below.
 
 Credentials handling:
@@ -26,45 +50,42 @@ Credentials handling:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
 
 from .models import Article, BuyeeCredentials
 from .storage import new_id
 
 logger = logging.getLogger("buyee_scraper")
 
-BUYEE_LOGIN_URL = "https://buyee.jp/signup/login"
-BUYEE_ORDER_HISTORY_URL = "https://buyee.jp/order/mypage/order/list"
+BUYEE_BASE_URL = "https://buyee.jp"
 
-# --- Selectors: adjust these against your real, logged-in account -------
+# --- Login: best-effort, NOT verified against a real login page (see notice
+# above). Adjust here if the login step fails. ---------------------------
+BUYEE_LOGIN_URL = f"{BUYEE_BASE_URL}/signup/login"
 LOGIN_SELECTORS = {
     "username_field": "input[name='login_id']",
     "password_field": "input[name='password']",
     "submit_button": "button[type='submit']",
 }
 
-ORDER_LIST_SELECTORS = {
-    "order_row": ".order-list__item, .mypage-order-list tr",
-    "order_link": "a::attr(href)",
-}
-
-INVOICE_SELECTORS = {
-    "article_row": ".order-detail__item, .item-detail-row",
-    "article_name": ".item-name, .product-name::text",
-    "article_photo": "img::attr(src)",
-    "article_price": ".item-price, .price::text",
-    "japan_shipping": ".domestic-shipping, .shipping-fee::text",
-}
+# --- "Colis expedies" list: CONFIRMED against a real account. ------------
+BUYEE_BAGGAGES_URL_TEMPLATE = BUYEE_BASE_URL + "/mybaggages/shipped/{page}"
+MAX_BAGGAGE_PAGES = 5
 
 
 @dataclass
 class ScrapeResult:
-    articles: list[Article]
-    warnings: list[str]
+    articles: list[Article] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
-def _parse_price_text(text: str | None) -> float:
-    """Turn a Buyee price string like '¥1,980' or '1,980円' into a float."""
+def _parse_jpy(text: str | None) -> float:
+    """Turns a Buyee price string like '3,750 YENS' or '¥1,980' into a
+    float."""
     if not text:
         return 0.0
     digits = "".join(ch for ch in text if ch.isdigit() or ch == ".")
@@ -74,12 +95,209 @@ def _parse_price_text(text: str | None) -> float:
         return 0.0
 
 
-def fetch_invoices(credentials: BuyeeCredentials, max_orders: int = 20) -> ScrapeResult:
-    """Log into Buyee and pull recent orders/invoices: article name, photo,
-    item price and Japan domestic shipping for each line item.
+def _parse_eur_from_text(text: str | None) -> float | None:
+    """Buyee sometimes shows its own EUR conversion next to a JPY amount,
+    e.g. '(€105.49)' or '€183.99   (   31,450 YENS   )'. Pulls the euro
+    figure out when present, returns None otherwise (most accounts don't
+    have this currency-conversion feature turned on, which is fine -- the
+    app still works from the JPY figures and a manually entered rate)."""
+    if not text:
+        return None
+    m = re.search(r"€\s*([\d.,]+)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
-    Uses Scrapling's DynamicSession (a real, scriptable browser) because
-    Buyee's login form and order pages are JS-rendered.
+
+def _item_id_from_href(href: str | None) -> str | None:
+    """The 'Identifiant' column of the per-item shipping-fee table matches
+    the last path segment of the item's own listing URL, whatever the
+    marketplace it came from, e.g.:
+      https://buyee.jp/item/jdirectitems/auction/q1235841865 -> 'q1235841865'
+      https://buyee.jp/mercari/item/m39503153117              -> 'm39503153117'
+    """
+    if not href:
+        return None
+    return href.rstrip("/").split("/")[-1]
+
+
+def _parse_package(pkg_soup: BeautifulSoup) -> tuple[list[dict], list[str]]:
+    """Parses one <li class="luggageInfo"> package card (one 'colis') into
+    a list of raw item dicts (one per order/article row) plus any
+    warnings specific to this package."""
+    warnings: list[str] = []
+    items: list[dict] = []
+
+    # --- 1. "Contenu du colis": one row per item/order in this package ---
+    order_table = pkg_soup.find("table", class_="luggageInfo_order")
+    order_rows = []
+    if order_table and order_table.find("tbody"):
+        order_rows = order_table.find("tbody").find_all("tr")[1:]  # skip header row
+    if not order_rows:
+        warnings.append(
+            "Un colis Buyee n'a pas ete reconnu (table.luggageInfo_order "
+            "introuvable ou vide) -- selecteurs peut-etre a ajuster."
+        )
+
+    for row in order_rows:
+        cells = row.find_all("td")
+        if len(cells) < 3:
+            continue
+        site_de_vente = cells[0].get_text(strip=True)
+        order_number = cells[1].get_text(strip=True)
+        name_link = cells[2].find("a")
+        name = name_link.get_text(strip=True) if name_link else cells[2].get_text(strip=True)
+        item_href = name_link["href"] if name_link and name_link.get("href") else None
+        item_url = urljoin(BUYEE_BASE_URL, item_href) if item_href else None
+        item_id = _item_id_from_href(item_href)
+
+        fiche_link = row.find("a", class_="g-button")
+        fiche_url = (
+            urljoin(BUYEE_BASE_URL, fiche_link["href"])
+            if fiche_link and fiche_link.get("href")
+            else None
+        )
+
+        quantity = 1
+        # The quantity column is the one right before the trailing
+        # "Fiche complete" button column.
+        for cell in reversed(cells[:-1]):
+            txt = cell.get_text(strip=True)
+            if txt.isdigit():
+                quantity = int(txt)
+                break
+
+        items.append(
+            {
+                "site_de_vente": site_de_vente,
+                "order_number": order_number,
+                "name": name or "Article sans nom",
+                "item_url": item_url,
+                "item_id": item_id,
+                "fiche_url": fiche_url,
+                "quantity": quantity,
+            }
+        )
+
+    # --- 2. "Frais de port": per-item JP domestic shipping + package-level
+    # international shipping (already hidden-but-present in the DOM, no
+    # click needed). -------------------------------------------------------
+    jp_shipping_by_id: dict[str, float] = {}
+    international_shipping_jpy = 0.0
+    international_shipping_eur_buyee: float | None = None
+
+    amount_container = pkg_soup.find("div", class_="amount_info_container")
+    if amount_container:
+        per_item_table = amount_container.find("table")
+        if per_item_table and per_item_table.find("tbody"):
+            rows = per_item_table.find("tbody").find_all("tr")[1:]  # skip header row
+            for r in rows:
+                tds = r.find_all("td")
+                if len(tds) != 2:
+                    continue
+                label = tds[0].get_text(strip=True)
+                if label == "Total" or "Commission de vente" in label:
+                    continue
+                jp_shipping_by_id[label] = _parse_jpy(tds[1].get_text(strip=True))
+
+        totals_dl = amount_container.find("dl")
+        if totals_dl:
+            dts = totals_dl.find_all("dt")
+            dds = totals_dl.find_all("dd")
+            for dt, dd in zip(dts, dds):
+                label = dt.get_text(strip=True)
+                if "Frais de port internationaux" in label:
+                    international_shipping_jpy = _parse_jpy(dd.get_text(strip=True))
+                elif "totaux" in label.lower() and "expedition" in label.lower():
+                    international_shipping_eur_buyee = _parse_eur_from_text(
+                        dd.get_text(" ", strip=True)
+                    )
+    else:
+        warnings.append(
+            "Un colis Buyee n'a pas de detail des frais de port "
+            "(div.amount_info_container introuvable)."
+        )
+
+    # Buyee bills ONE combined international shipping fee for the whole
+    # package, never per item -- split it evenly across the items it
+    # contains as a reasonable approximation the user can still edit.
+    n_items = len(items) or 1
+    intl_share_jpy = international_shipping_jpy / n_items if international_shipping_jpy else 0.0
+    intl_share_eur = (
+        international_shipping_eur_buyee / n_items if international_shipping_eur_buyee else None
+    )
+    if international_shipping_jpy and n_items > 1:
+        warnings.append(
+            f"Frais de port international Buyee ({international_shipping_jpy:.0f} YENS) "
+            f"reparti a parts egales entre les {n_items} articles d'un meme colis "
+            "-- ajustable dans la fiche de chaque article."
+        )
+
+    for it in items:
+        it["japan_domestic_shipping_jpy"] = (
+            jp_shipping_by_id.get(it["item_id"], 0.0) if it["item_id"] else 0.0
+        )
+        it["international_shipping_jpy"] = intl_share_jpy
+        it["international_shipping_eur_buyee"] = intl_share_eur
+
+    return items, warnings
+
+
+def _fetch_item_details(session, fiche_url: str) -> dict:
+    """Visits one 'Fiche complete' order-detail page to get the photo and
+    the exact price actually billed for that item, plus Buyee's own
+    JPY->EUR conversion when the account has that feature enabled."""
+    details: dict = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
+    try:
+        resp = session.fetch(fiche_url)
+    except Exception as exc:  # noqa: BLE001 - keep going, one bad item shouldn't fail the import
+        logger.warning("Echec du chargement de la fiche %s: %s", fiche_url, exc)
+        return details
+
+    soup = BeautifulSoup(str(resp.html_content), "html.parser")
+
+    img = soup.select_one("div.itemCard__item img.g-thumbnail__image")
+    if img and img.get("src"):
+        details["photo_url"] = urljoin(fiche_url, img["src"])
+
+    price_block = soup.find("div", class_="g-priceDetails")
+    if price_block:
+        total_el = price_block.select_one(".g-priceDetails__priceTotal .g-price")
+        fx_el = price_block.select_one(".g-priceDetails__priceTotal .g-priceFx")
+        if total_el:
+            details["item_price_jpy"] = _parse_jpy(total_el.get_text(strip=True))
+        if fx_el:
+            details["buyee_price_eur"] = _parse_eur_from_text(fx_el.get_text(strip=True))
+
+    return details
+
+
+def _login_looks_successful(html: str) -> bool:
+    """Heuristic check that the login actually worked, so a bad selector or
+    a wrong/expired password produces a clear warning instead of silently
+    trying to scrape a login page and finding nothing."""
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.select_one(LOGIN_SELECTORS["password_field"]):
+        return False  # still looking at a login form
+    if soup.find("a", href=re.compile(r"/mypage")):
+        return True
+    return True  # give the benefit of the doubt; the baggages page check below is authoritative
+
+
+def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 25) -> ScrapeResult:
+    """Logs into Buyee and pulls recent shipped packages: article name,
+    photo, item price, Japan domestic shipping AND the real international
+    (Japan -> France) shipping fee Buyee already charged, for each line
+    item.
+
+    Uses Scrapling's DynamicSession (a real, scriptable Chromium browser)
+    because Buyee's login form and account pages are JS-rendered, and
+    BeautifulSoup to parse the resulting HTML (Scrapling's own selector API
+    is fine for simple lookups, but this page's nested toggle panels and
+    label/value tables are much clearer to express with BeautifulSoup).
     """
     warnings: list[str] = []
     articles: list[Article] = []
@@ -93,59 +311,68 @@ def fetch_invoices(credentials: BuyeeCredentials, max_orders: int = 20) -> Scrap
         ) from exc
 
     def _do_login(page):
-        """Runs inside Scrapling's browser via page_action: receives the real
-        Playwright Page object to fill and submit the login form."""
+        """Runs inside Scrapling's browser via page_action: receives the
+        real Playwright Page object to fill and submit the login form."""
         page.fill(LOGIN_SELECTORS["username_field"], credentials.username)
         page.fill(LOGIN_SELECTORS["password_field"], credentials.password)
         page.click(LOGIN_SELECTORS["submit_button"])
         page.wait_for_load_state("networkidle")
 
     with DynamicSession(headless=True, network_idle=True) as session:
-        # page_action runs our login callback against the real browser page
-        # right after navigation, before Scrapling hands back the parsed result.
-        session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
-
-        order_list_page = session.fetch(BUYEE_ORDER_HISTORY_URL)
-        order_rows = order_list_page.css(ORDER_LIST_SELECTORS["order_row"])
-
-        if not order_rows:
+        login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
+        if not _login_looks_successful(str(login_result.html_content)):
             warnings.append(
-                "Aucune commande trouvee avec le selecteur actuel -- verifie "
-                "ORDER_LIST_SELECTORS dans buyee_scraper.py contre ton compte reel."
+                "La connexion a Buyee semble avoir echoue (toujours sur une page de "
+                "connexion apres l'envoi du formulaire) -- verifie tes identifiants, "
+                "ou verifie LOGIN_SELECTORS dans buyee_scraper.py si tes identifiants "
+                "sont pourtant corrects."
             )
 
-        order_links = []
-        for row in order_rows[:max_orders]:
-            hrefs = row.css(ORDER_LIST_SELECTORS["order_link"])
-            if hrefs:
-                order_links.append(hrefs[0])
-
-        for link in order_links:
-            invoice_url = link if link.startswith("http") else f"https://buyee.jp{link}"
-            invoice_page = session.fetch(invoice_url)
-            item_rows = invoice_page.css(INVOICE_SELECTORS["article_row"])
-
-            for row in item_rows:
-                name_el = row.css(INVOICE_SELECTORS["article_name"])
-                photo_el = row.css(INVOICE_SELECTORS["article_photo"])
-                price_el = row.css(INVOICE_SELECTORS["article_price"])
-                shipping_el = row.css(INVOICE_SELECTORS["japan_shipping"])
-
-                name = name_el.get() if name_el else "Article sans nom"
-                photo_url = photo_el.get() if photo_el else None
-                price_jpy = _parse_price_text(price_el.get() if price_el else None)
-                shipping_jpy = _parse_price_text(shipping_el.get() if shipping_el else None)
-
-                articles.append(
-                    Article(
-                        id=new_id(),
-                        source_invoice_id=invoice_url,
-                        name=name.strip() if isinstance(name, str) else "Article sans nom",
-                        photo_url=photo_url,
-                        item_price_jpy=price_jpy,
-                        japan_domestic_shipping_jpy=shipping_jpy,
+        raw_items: list[dict] = []
+        page_num = 1
+        while len(raw_items) < max_items and page_num <= MAX_BAGGAGE_PAGES:
+            list_url = BUYEE_BAGGAGES_URL_TEMPLATE.format(page=page_num)
+            resp = session.fetch(list_url)
+            soup = BeautifulSoup(str(resp.html_content), "html.parser")
+            packages = soup.find_all("li", class_="luggageInfo")
+            if not packages:
+                if page_num == 1:
+                    warnings.append(
+                        "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
+                        "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
+                        "encore en cours (pas encore expedies), ils n'apparaissent pas "
+                        "encore ici -- c'est normal, Buyee ne facture les frais de port "
+                        "internationaux qu'une fois le colis expedie."
                     )
+                break
+            for pkg in packages:
+                items, pkg_warnings = _parse_package(pkg)
+                warnings.extend(pkg_warnings)
+                raw_items.extend(items)
+            page_num += 1
+
+        raw_items = raw_items[:max_items]
+
+        for it in raw_items:
+            details = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
+            if it.get("fiche_url"):
+                details = _fetch_item_details(session, it["fiche_url"])
+
+            articles.append(
+                Article(
+                    id=new_id(),
+                    source_invoice_id=it.get("order_number") or it.get("item_id") or new_id(),
+                    name=it["name"],
+                    photo_url=details["photo_url"],
+                    item_price_jpy=details["item_price_jpy"] or 0.0,
+                    japan_domestic_shipping_jpy=it["japan_domestic_shipping_jpy"],
+                    international_shipping_jpy=it["international_shipping_jpy"],
+                    international_shipping_eur=(
+                        it["international_shipping_eur_buyee"]
+                    ),
+                    buyee_price_eur=details["buyee_price_eur"],
                 )
+            )
 
     if not articles:
         warnings.append(
@@ -169,6 +396,9 @@ def fetch_invoices_demo() -> ScrapeResult:
             photo_url="https://picsum.photos/seed/gundam/400/400",
             item_price_jpy=4800,
             japan_domestic_shipping_jpy=600,
+            international_shipping_jpy=3500,
+            international_shipping_eur=20.5,
+            buyee_price_eur=27.5,
             category="toys_figures",
         ),
         Article(
@@ -178,10 +408,16 @@ def fetch_invoices_demo() -> ScrapeResult:
             photo_url="https://picsum.photos/seed/onepiece/400/400",
             item_price_jpy=6200,
             japan_domestic_shipping_jpy=600,
+            international_shipping_jpy=3500,
+            international_shipping_eur=20.5,
+            buyee_price_eur=35.6,
             category="trading_cards",
         ),
     ]
-    return ScrapeResult(articles=sample, warnings=[
-        "Donnees de demonstration -- branche fetch_invoices() avec tes vrais identifiants "
-        "pour remplacer ces exemples par tes factures reelles."
-    ])
+    return ScrapeResult(
+        articles=sample,
+        warnings=[
+            "Donnees de demonstration -- branche fetch_invoices() avec tes vrais identifiants "
+            "pour remplacer ces exemples par tes factures reelles."
+        ],
+    )

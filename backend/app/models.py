@@ -25,6 +25,17 @@ class Article(BaseModel):
     photo_local_path: Optional[str] = None
     item_price_jpy: float = 0.0
     japan_domestic_shipping_jpy: float = 0.0
+    # Frais de port international (Japon -> France) reellement facture par
+    # Buyee pour le colis contenant cet article (reparti a parts egales
+    # quand un colis regroupe plusieurs articles). None si Buyee n'a pas
+    # encore facture ce frais (colis pas encore expedie) -- dans ce cas
+    # l'utilisateur saisit le montant manuellement comme avant.
+    international_shipping_jpy: float = 0.0
+    international_shipping_eur: Optional[float] = None
+    # Conversion EUR du prix de l'article telle qu'affichee par Buyee
+    # elle-meme (fonctionnalite de conversion de devise de Buyee), utilisee
+    # uniquement pour pre-remplir un taux de change par defaut plus precis.
+    buyee_price_eur: Optional[float] = None
     category: str = "default"
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
