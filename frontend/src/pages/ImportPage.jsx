@@ -8,17 +8,40 @@ export default function ImportPage() {
   const [verificationCode, setVerificationCode] = useState('')
   const [needsVerificationCode, setNeedsVerificationCode] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [statusMessage, setStatusMessage] = useState(null)
   const [error, setError] = useState(null)
   const [warnings, setWarnings] = useState([])
   const [importedCount, setImportedCount] = useState(null)
   const navigate = useNavigate()
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
   async function handleImport(e) {
     e.preventDefault()
     setLoading(true)
     setError(null)
+    setStatusMessage(
+      'Connexion a Buyee en cours... ca peut prendre 1 a 2 minutes (navigateur reel + '
+        + 'eventuelle page de code). Reste sur cette page en attendant.'
+    )
     try {
-      const res = await api.importInvoices(username, password, verificationCode)
+      const { job_id: jobId } = await api.importInvoicesStart(username, password, verificationCode)
+      // On interroge le statut par petites requetes rapides plutot que de
+      // garder une seule requete ouverte plusieurs minutes -- c'est cette
+      // requete longue qui provoquait le "Failed to fetch" des que le
+      // reseau du telephone la coupait, meme quand Buyee finissait par
+      // repondre correctement un peu plus tard.
+      let res = null
+      for (let i = 0; i < 90; i++) {
+        await sleep(3000)
+        res = await api.getImportStatus(jobId)
+        if (res.status !== 'running') break
+      }
+      if (!res || res.status === 'running') {
+        throw new Error("L'import prend anormalement longtemps (plus de 4-5 minutes), reessaie plus tard.")
+      }
       const w = res.warnings || []
       setWarnings(w)
       setImportedCount(res.articles?.length ?? 0)
@@ -30,6 +53,7 @@ export default function ImportPage() {
       setError(err.message)
     } finally {
       setLoading(false)
+      setStatusMessage(null)
     }
   }
 
@@ -79,6 +103,7 @@ export default function ImportPage() {
             Charger des donnees de demo
           </button>
         </form>
+        {statusMessage && <p>{statusMessage}</p>}
         {error && <p style={{ color: 'var(--bad)' }}>{error}</p>}
         {importedCount !== null && <p>{importedCount} article(s) importe(s).</p>}
         {warnings.map((w, i) => (

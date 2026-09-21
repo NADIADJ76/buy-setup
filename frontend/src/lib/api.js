@@ -18,11 +18,21 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  importInvoices: (username, password, verificationCode) =>
+  // L'import Buyee reel peut prendre jusqu'a 1-2 minutes (navigateur reel +
+  // connexion + eventuelle page de code de verification), et un plan Render
+  // gratuit est lent. Garder une seule requete HTTP ouverte aussi longtemps
+  // causait un "Failed to fetch" des que le telephone/le reseau coupait la
+  // connexion, meme quand le serveur finissait par reussir un peu plus tard.
+  // Le backend demarre donc l'import en arriere-plan et renvoie tout de
+  // suite un job_id ; on interroge ensuite son statut par petites requetes
+  // rapides (voir getImportStatus / ImportPage.jsx), ce qui evite d'avoir
+  // une requete longue susceptible d'etre coupee.
+  importInvoicesStart: (username, password, verificationCode) =>
     request('/invoices/import', {
       method: 'POST',
       body: JSON.stringify({ username, password, verification_code: verificationCode || null }),
     }),
+  getImportStatus: (jobId) => request(`/invoices/import/${jobId}`),
   importDemo: () => request('/invoices/demo', { method: 'POST' }),
   listArticles: () => request('/invoices'),
   getArticle: (id) => request(`/invoices/${id}`),
