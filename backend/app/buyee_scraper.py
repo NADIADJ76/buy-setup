@@ -436,6 +436,37 @@ def _describe_input_fields(html: str) -> str:
     return "; ".join(fields) if fields else "(aucun champ input visible trouve)"
 
 
+def _describe_clickable_elements(html: str) -> str:
+    """Lists every <button> and <a> on a page (id/class/text) -- same idea
+    as _describe_input_fields, but for the submit control : Buyee's
+    "Login" button on the main login page turned out to be a plain <a>
+    wired up by JS rather than a real <button>/<input type=submit> (see
+    SUBMIT_BUTTON_CANDIDATES above), so a different page (like the
+    twoFactor code page) may well use yet another pattern our existing
+    candidates don't match."""
+    soup = BeautifulSoup(html, "html.parser")
+    elements = []
+    for tag_name in ("button", "a", "input"):
+        for el in soup.find_all(tag_name):
+            if tag_name == "input" and el.get("type") not in ("submit", "button"):
+                continue
+            text = el.get_text(strip=True)[:40]
+            elements.append(
+                f"<{tag_name} id={el.get('id')!r} class={el.get('class')!r} "
+                f"texte={text!r}>"
+            )
+    return "; ".join(elements) if elements else "(aucun bouton/lien trouve)"
+
+
+# CONFIRMED on 2026-09-21 against the real twoFactor page (via the
+# _describe_input_fields diagnostic below): Buyee splits the 6-digit
+# verification code into 6 separate single-character text boxes with ids
+# input1..input6, instead of one field matching VERIFICATION_CODE_FIELD_CANDIDATES
+# (that list is kept in case Buyee ever uses a single-field layout for some
+# accounts/locales).
+CODE_BOX_INPUT_IDS = [f"input{i}" for i in range(1, 7)]
+
+
 def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeResult:
     """Logs into Buyee and pulls recent shipped packages: article name,
     photo, item price, Japan domestic shipping AND the real international
@@ -464,6 +495,7 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
         "password_selector": None,
         "submit_selector": None,
         "verification_field_selector": None,
+        "verification_submit_selector": None,
         "cookies": None,
         "user_agent": None,
         "error": None,
@@ -512,6 +544,20 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 continue
         return None
 
+    def _find_code_boxes(page) -> list[str]:
+        """CONFIRMED on 2026-09-21: Buyee's twoFactor page doesn't have one
+        code field -- it splits the 6-digit code into 6 separate
+        single-character boxes with ids input1..input6. Returns the ids
+        that are actually present right now, or an empty list."""
+        present = []
+        for box_id in CODE_BOX_INPUT_IDS:
+            try:
+                if page.query_selector(f"#{box_id}"):
+                    present.append(box_id)
+            except Exception:  # noqa: BLE001
+                continue
+        return present
+
     def _capture_session(page) -> None:
         """Grabs the logged-in cookies + the real browser's user agent so
         the rest of the scrape can use a plain, lightweight HTTP session
@@ -553,13 +599,29 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             pass
 
         verification_selector = _find_first_present(page, VERIFICATION_CODE_FIELD_CANDIDATES)
-        if verification_selector:
-            login_debug["verification_field_selector"] = verification_selector
+        code_boxes = _find_code_boxes(page) if not verification_selector else []
+        if verification_selector or code_boxes:
+            login_debug["verification_field_selector"] = (
+                verification_selector
+                if verification_selector
+                else f"#{code_boxes[0]}..#{code_boxes[-1]} (6 cases separees)"
+            )
             if not credentials.verification_code:
                 login_debug["error"] = "code_de_verification_requis"
                 return
-            page.fill(verification_selector, credentials.verification_code, timeout=FIELD_TRY_TIMEOUT_MS)
-            _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+            code_digits = "".join(ch for ch in credentials.verification_code if ch.isdigit())
+            if verification_selector:
+                page.fill(verification_selector, code_digits, timeout=FIELD_TRY_TIMEOUT_MS)
+            elif len(code_digits) < len(code_boxes):
+                login_debug["error"] = (
+                    f"code_de_verification_incomplet ({len(code_digits)} chiffres recus, "
+                    f"{len(code_boxes)} cases attendues)"
+                )
+                return
+            else:
+                for box_id, digit in zip(code_boxes, code_digits):
+                    page.fill(f"#{box_id}", digit, timeout=FIELD_TRY_TIMEOUT_MS)
+            login_debug["verification_submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:  # noqa: BLE001
@@ -593,6 +655,11 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             f"bouton={login_debug['submit_selector']!r}"
         )
         warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
+        if login_debug["verification_field_selector"]:
+            warnings.append(
+                f"[diagnostic] Code de verification : champ={login_debug['verification_field_selector']!r}, "
+                f"bouton={login_debug['verification_submit_selector']!r}"
+            )
 
         if login_debug["error"] == "code_de_verification_requis":
             warnings.append(
@@ -600,6 +667,14 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 "mail, y compris les spams -- l'objet mentionne une 'connexion douteuse'). "
                 "Renseigne ce code dans le champ prevu et reessaie l'import ; tes "
                 "identifiants sont corrects, il ne manque que ce code."
+            )
+            return ScrapeResult(articles=[], warnings=warnings)
+
+        if login_debug["error"] and login_debug["error"].startswith("code_de_verification_incomplet"):
+            warnings.append(
+                f"Le code de verification saisi ne fait pas 6 chiffres ({login_debug['error']}). "
+                "Buyee attend un code a 6 chiffres recu par email -- reessaie en copiant le code "
+                "exact du dernier email 'connexion douteuse'."
             )
             return ScrapeResult(articles=[], warnings=warnings)
 
@@ -619,19 +694,36 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 f"PASSWORD_FIELD_CANDIDATES / SUBMIT_BUTTON_CANDIDATES) -- envoie le HTML "
                 f"de https://buyee.jp/signup/login (deconnectee) pour que je trouve les bons."
             )
-        elif not login_ok and looks_like_verification_page:
+        elif not login_ok and looks_like_verification_page and not login_debug["verification_field_selector"]:
             # On est bien arrive sur la page de code de verification (2FA)
-            # Buyee, mais aucun des VERIFICATION_CODE_FIELD_CANDIDATES deja
-            # essayes n'a trouve le bon champ pendant _do_login -- donc le
-            # code (meme fourni) n'a jamais pu etre saisi. On liste tous les
-            # champs <input> visibles de cette page dans un warning pour
-            # identifier le vrai champ sans devoir re-uploader un fichier HTML.
+            # Buyee, mais aucun des VERIFICATION_CODE_FIELD_CANDIDATES ni le
+            # motif a 6 cases (CODE_BOX_INPUT_IDS) n'a ete trouve pendant
+            # _do_login -- donc le code (meme fourni) n'a jamais pu etre
+            # saisi. On liste tous les champs <input> visibles de cette page
+            # dans un warning pour identifier le vrai champ sans devoir
+            # re-uploader un fichier HTML.
             warnings.append(
                 "Buyee a redirige vers sa page de code de verification (2FA), mais "
                 "aucun champ de saisie connu n'a ete trouve pour y entrer le code -- "
-                "il faut ajuster VERIFICATION_CODE_FIELD_CANDIDATES dans "
-                "buyee_scraper.py. Champs <input> visibles trouves sur cette page : "
+                "il faut ajuster VERIFICATION_CODE_FIELD_CANDIDATES ou CODE_BOX_INPUT_IDS "
+                "dans buyee_scraper.py. Champs <input> visibles trouves sur cette page : "
                 f"{_describe_input_fields(str(login_result.html_content))}"
+            )
+        elif not login_ok and looks_like_verification_page:
+            # Le champ (ou les 6 cases) du code ONT ete trouves et remplis,
+            # et un clic sur SUBMIT_BUTTON_CANDIDATES a ete tente
+            # (verification_submit_selector), mais on est toujours sur la
+            # page de verification -- soit le code etait deja expire (Buyee
+            # en emet un nouveau a chaque tentative de connexion), soit ce
+            # clic n'a pas vise le vrai bouton de validation de cette page.
+            # On liste les boutons/liens presents pour trouver le bon.
+            warnings.append(
+                "Le code de verification a ete saisi mais Buyee est reste sur la page de "
+                "verification -- soit ce code est expire (Buyee en renvoie un nouveau a "
+                "chaque tentative : utilise le DERNIER email recu, pas un ancien), soit le "
+                f"bouton de validation utilise ({login_debug['verification_submit_selector']!r}) "
+                "n'etait pas le bon. Boutons/liens visibles sur cette page : "
+                f"{_describe_clickable_elements(str(login_result.html_content))}"
             )
         elif not login_ok:
             warnings.append(
