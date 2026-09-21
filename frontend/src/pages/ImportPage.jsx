@@ -18,29 +18,72 @@ export default function ImportPage() {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  // CONFIRMED BUG on 2026-09-21: le serveur gratuit s'endort apres un
+  // moment d'inactivite et se reveille au vol sur la requete suivante --
+  // les journaux du serveur montraient le tout premier import apres un
+  // reveil reussir cote serveur (POST 200, plusieurs GET de suivi 200 OK,
+  // le navigateur Buyee termine proprement), mais l'appli affichait quand
+  // meme "Failed to fetch" : UNE seule requete de suivi avait du se perdre
+  // en route juste apres le reveil du serveur, et comme la boucle
+  // abandonnait au premier echec, tout le suivi s'arretait alors que le
+  // serveur continuait de travailler tout seul derriere, pour rien.
+  // isNetworkBlip distingue cet echec reseau ponctuel (fetch() lui-meme
+  // rejete, err.name === 'TypeError') d'une vraie erreur renvoyee par le
+  // serveur une fois la requete arrivee (ex: 502 parce que l'import a
+  // vraiment echoue) -- seul le premier cas merite d'etre retente en
+  // silence plutot que de faire abandonner tout l'import.
+  function isNetworkBlip(err) {
+    return err instanceof TypeError || /failed to fetch/i.test(err?.message || '')
+  }
+
   async function handleImport(e) {
     e.preventDefault()
     setLoading(true)
     setError(null)
     setStatusMessage(
       'Connexion a Buyee en cours... ca peut prendre 1 a 2 minutes (navigateur reel + '
-        + 'eventuelle page de code). Reste sur cette page en attendant.'
+        + 'eventuelle page de code, et le serveur gratuit peut avoir besoin de se '
+        + 'reveiller). Reste sur cette page en attendant.'
     )
     try {
-      const { job_id: jobId } = await api.importInvoicesStart(username, password, verificationCode)
+      // Le tout premier appel (demarrage du job) peut lui-meme tomber sur un
+      // blip reseau pendant que le serveur gratuit se reveille -- quelques
+      // tentatives silencieuses avant d'abandonner.
+      let jobId = null
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const started = await api.importInvoicesStart(username, password, verificationCode)
+          jobId = started.job_id
+          break
+        } catch (err) {
+          if (!isNetworkBlip(err) || attempt >= 5) throw err
+          await sleep(3000)
+        }
+      }
+
       // On interroge le statut par petites requetes rapides plutot que de
       // garder une seule requete ouverte plusieurs minutes -- c'est cette
       // requete longue qui provoquait le "Failed to fetch" des que le
       // reseau du telephone la coupait, meme quand Buyee finissait par
-      // repondre correctement un peu plus tard.
+      // repondre correctement un peu plus tard. Un blip reseau isole sur
+      // UNE requete de suivi ne doit plus, non plus, faire abandonner tout
+      // le suivi (voir isNetworkBlip ci-dessus) -- seulement plusieurs
+      // echecs reseau D'AFFILEE.
       let res = null
-      for (let i = 0; i < 90; i++) {
+      let consecutiveBlips = 0
+      for (let i = 0; i < 120; i++) {
         await sleep(3000)
-        res = await api.getImportStatus(jobId)
+        try {
+          res = await api.getImportStatus(jobId)
+          consecutiveBlips = 0
+        } catch (err) {
+          if (!isNetworkBlip(err) || ++consecutiveBlips >= 5) throw err
+          continue
+        }
         if (res.status !== 'running') break
       }
       if (!res || res.status === 'running') {
-        throw new Error("L'import prend anormalement longtemps (plus de 4-5 minutes), reessaie plus tard.")
+        throw new Error("L'import prend anormalement longtemps (plus de 5-6 minutes), reessaie plus tard.")
       }
       const w = res.warnings || []
       setWarnings(w)
