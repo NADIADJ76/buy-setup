@@ -619,9 +619,41 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 )
                 return
             else:
+                # CONFIRMED BUG on 2026-09-21: page.fill() sets each box's
+                # value directly via JS and only fires "input"/"change" --
+                # it does NOT fire real keydown/keypress/keyup events. The
+                # diagnostic dump of this page's buttons/links (sent back
+                # to the user) showed no plausible "validate the code"
+                # button at all -- just the cookie banner, Google Translate
+                # widget and language switcher -- which strongly suggests
+                # this is a 6-box OTP widget that auto-advances focus and
+                # auto-submits on the 6th real keystroke, the same way a
+                # phone's own OTP autofill UI works. page.fill() never
+                # triggers that JS, so the code was silently never
+                # submitted at all. Using a real click + keyboard.type()
+                # per box fires proper key events, which this kind of
+                # widget listens for.
                 for box_id, digit in zip(code_boxes, code_digits):
-                    page.fill(f"#{box_id}", digit, timeout=FIELD_TRY_TIMEOUT_MS)
-            login_debug["verification_submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+                    try:
+                        page.click(f"#{box_id}", timeout=FIELD_TRY_TIMEOUT_MS)
+                        page.keyboard.type(digit, delay=80)
+                    except Exception:  # noqa: BLE001 - fall back to a direct
+                        # value-set for this one box rather than aborting
+                        # the whole code entry over one flaky box.
+                        page.fill(f"#{box_id}", digit, timeout=FIELD_TRY_TIMEOUT_MS)
+                # Give any auto-advance/auto-submit JS triggered by that
+                # last keystroke a brief moment to run before we check.
+                page.wait_for_timeout(800)
+                # Fallback in case this widget needs an explicit submit
+                # instead of (or in addition to) auto-submitting: try
+                # Enter first (common for OTP forms), then any of our
+                # known button candidates (harmless no-op if neither
+                # exists / already submitted).
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
+                login_debug["verification_submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:  # noqa: BLE001
