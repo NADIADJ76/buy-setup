@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 
 from .. import storage
 from ..buyee_scraper import fetch_invoices_demo
-from ..models import Article, BuyeeCredentials
+from ..models import Article, BuyeeCredentials, VerificationCodeSubmission
 
 logger = logging.getLogger("buy_setup")
 
@@ -44,6 +44,22 @@ router = APIRouter(prefix="/invoices", tags=["invoices"])
 #    exactly the kind of long-lived request a phone's network, a proxy, or
 #    the browser itself can silently cut off, showing "Failed to fetch"
 #    even when the backend would otherwise have succeeded a bit later.
+#
+# CONFIRMED ROOT CAUSE #2 on 2026-09-21: Buyee issues a brand-new one-time
+# verification code by email on EVERY login attempt, so the original
+# single-request design (username+password+code all at once) could never
+# work -- by the time the user had the code in hand, a fresh attempt with
+# it would already be invalidating it. Import is therefore now a two-phase
+# job:
+#   POST /invoices/import           -- phase 1, username+password only.
+#   POST /invoices/import/{id}/verify -- phase 2, just the code, resuming
+#                                        the SAME pending session captured
+#                                        by phase 1 (its cookies are kept
+#                                        here, server-side, in the job
+#                                        dict -- never sent back to the
+#                                        client).
+# Both phases share the same GET /invoices/import/{id} polling endpoint and
+# the same background-worker-process machinery.
 IMPORT_PROCESS_TIMEOUT_SECONDS = 240
 
 # The worker must be launched with the backend's own root directory (the
@@ -69,7 +85,12 @@ def _set_job(job_id: str, job: dict) -> None:
         _import_jobs[job_id] = job
 
 
-def _run_import_job(job_id: str, credentials: BuyeeCredentials) -> None:
+def _run_worker(job_id: str, payload: dict) -> None:
+    """Runs buyee_import_worker.py (either mode="login" or mode="verify",
+    see that file's docstring) with `payload` as its stdin JSON, and
+    updates _import_jobs[job_id] from whatever it prints. Shared by both
+    the initial username+password phase and the verification-code phase,
+    since the worker's output shape is identical for both."""
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "app.buyee_import_worker"],
@@ -94,7 +115,7 @@ def _run_import_job(job_id: str, credentials: BuyeeCredentials) -> None:
     try:
         try:
             stdout, stderr = proc.communicate(
-                input=json.dumps(credentials.model_dump()),
+                input=json.dumps(payload),
                 timeout=IMPORT_PROCESS_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
@@ -136,7 +157,7 @@ def _run_import_job(job_id: str, credentials: BuyeeCredentials) -> None:
 
         try:
             last_line = [line for line in stdout.splitlines() if line.strip()][-1]
-            payload = json.loads(last_line)
+            result = json.loads(last_line)
         except Exception as exc:  # noqa: BLE001
             logger.error("Import Buyee : reponse illisible (job %s) : %r\nstderr:\n%s", job_id, stdout, stderr)
             _set_job(job_id, {
@@ -145,11 +166,24 @@ def _run_import_job(job_id: str, credentials: BuyeeCredentials) -> None:
             })
             return
 
-        saved = storage.upsert_articles(payload["articles"])
+        if result.get("status") == "code_required":
+            # Pending 2FA: keep the session's cookies server-side only (key
+            # prefixed with "_" so the GET endpoint below strips it before
+            # ever returning the job to the client) until the user submits
+            # the code via POST /invoices/import/{job_id}/verify.
+            _set_job(job_id, {
+                "status": "code_required",
+                "warnings": result.get("warnings", []),
+                "_session_cookies": result.get("session_cookies"),
+                "_session_user_agent": result.get("session_user_agent"),
+            })
+            return
+
+        saved = storage.upsert_articles(result["articles"])
         _set_job(job_id, {
             "status": "done",
             "articles": saved,
-            "warnings": payload["warnings"],
+            "warnings": result.get("warnings", []),
         })
     except Exception as exc:  # noqa: BLE001 - absolute last resort: a job must
         # NEVER be left stuck at "running" forever because of an exception
@@ -167,15 +201,53 @@ def _run_import_job(job_id: str, credentials: BuyeeCredentials) -> None:
 
 @router.post("/import")
 def import_invoices(credentials: BuyeeCredentials):
-    """Starts a Buyee import in the background and returns immediately with
-    a job_id ; poll GET /invoices/import/{job_id} for the result. Credentials
-    are only ever kept in memory / passed over a pipe to the worker process,
-    never written to disk, logged, or persisted, and are discarded once the
-    worker process exits."""
+    """Starts phase 1 of a Buyee import (username+password only) in the
+    background and returns immediately with a job_id ; poll
+    GET /invoices/import/{job_id} for the result. If Buyee then asks for an
+    emailed verification code, that GET response comes back with
+    status=="code_required" -- submit the code via
+    POST /invoices/import/{job_id}/verify (NOT by calling this endpoint
+    again, which would trigger a brand new login and a brand new code).
+    Credentials are only ever kept in memory / passed over a pipe to the
+    worker process, never written to disk, logged, or persisted, and are
+    discarded once the worker process exits."""
     job_id = uuid.uuid4().hex
+    _set_job(job_id, {"status": "running"})
+    thread = threading.Thread(
+        target=_run_worker,
+        args=(job_id, {"mode": "login", "username": credentials.username, "password": credentials.password}),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@router.post("/import/{job_id}/verify")
+def verify_import(job_id: str, submission: VerificationCodeSubmission):
+    """Phase 2: submits the verification code Buyee just emailed for the
+    pending login started by POST /invoices/import. Resumes that EXACT
+    session (via cookies kept server-side on the job, never exposed to the
+    client) instead of logging in again -- see buyee_scraper.py's
+    _login_phase1 docstring for why a fresh login here would always
+    invalidate the code. Returns immediately with the job back in
+    status=="running" ; keep polling GET /invoices/import/{job_id}."""
     with _import_jobs_lock:
-        _import_jobs[job_id] = {"status": "running"}
-    thread = threading.Thread(target=_run_import_job, args=(job_id, credentials), daemon=True)
+        job = _import_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Import introuvable (job_id inconnu ou expire).")
+    if job.get("status") != "code_required":
+        raise HTTPException(
+            status_code=409,
+            detail="Cet import n'attend pas de code de verification pour le moment.",
+        )
+    payload = {
+        "mode": "verify",
+        "session_cookies": job.get("_session_cookies"),
+        "session_user_agent": job.get("_session_user_agent"),
+        "verification_code": submission.verification_code,
+    }
+    _set_job(job_id, {"status": "running"})
+    thread = threading.Thread(target=_run_worker, args=(job_id, payload), daemon=True)
     thread.start()
     return {"job_id": job_id, "status": "running"}
 
@@ -188,7 +260,9 @@ def get_import_status(job_id: str):
         raise HTTPException(status_code=404, detail="Import introuvable (job_id inconnu ou expire).")
     if job["status"] == "error":
         raise HTTPException(status_code=502, detail=job["detail"])
-    return job
+    # Never expose the pending session's cookies to the client -- keys
+    # prefixed with "_" are internal-only (see _run_worker above).
+    return {k: v for k, v in job.items() if not k.startswith("_")}
 
 
 @router.post("/demo")

@@ -27,10 +27,24 @@ export const api = {
   // suite un job_id ; on interroge ensuite son statut par petites requetes
   // rapides (voir getImportStatus / ImportPage.jsx), ce qui evite d'avoir
   // une requete longue susceptible d'etre coupee.
-  importInvoicesStart: (username, password, verificationCode) =>
+  //
+  // CONFIRMED 2026-09-21 : Buyee emet un code de verification DIFFERENT a
+  // chaque tentative de connexion -- l'ancienne version renvoyait le code
+  // avec identifiant+mot de passe en un seul appel, ce qui relancait a
+  // chaque fois une connexion et invalidait donc le code avant meme de
+  // l'utiliser. importInvoicesStart ne fait plus que la phase 1
+  // (identifiant+mot de passe) ; si le job repond status:"code_required",
+  // le code recu par email est soumis a part via verifyImportCode, qui
+  // reprend EXACTEMENT la meme session en attente cote serveur.
+  importInvoicesStart: (username, password) =>
     request('/invoices/import', {
       method: 'POST',
-      body: JSON.stringify({ username, password, verification_code: verificationCode || null }),
+      body: JSON.stringify({ username, password }),
+    }),
+  verifyImportCode: (jobId, verificationCode) =>
+    request(`/invoices/import/${jobId}/verify`, {
+      method: 'POST',
+      body: JSON.stringify({ verification_code: verificationCode }),
     }),
   getImportStatus: (jobId) => request(`/invoices/import/${jobId}`),
   importDemo: () => request('/invoices/demo', { method: 'POST' }),

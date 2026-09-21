@@ -1,0 +1,32 @@
+[
+  {
+    "id": "dcc067ee21b9",
+    "source_invoice_id": "demo-invoice-1",
+    "name": "Figurine Gundam RG 1/144 (occasion)",
+    "photo_url": "https://picsum.photos/seed/gundam/400/400",
+    "photo_local_path": null,
+    "item_price_jpy": 4800.0,
+    "japan_domestic_shipping_jpy": 600.0,
+    "international_shipping_jpy": 3500.0,
+    "international_shipping_eur": 20.5,
+    "buyee_price_eur": 27.5,
+    "category": "toys_figures",
+    "notes": null,
+    "created_at": "2026-09-21T12:58:27.215671"
+  },
+  {
+    "id": "a6d9e05aa23b",
+    "source_invoice_id": "demo-invoice-1",
+    "name": "Coffret cartes One Piece OP-07 (scelle)",
+    "photo_url": "https://picsum.photos/seed/onepiece/400/400",
+    "photo_local_path": null,
+    "item_price_jpy": 6200.0,
+    "japan_domestic_shipping_jpy": 600.0,
+    "international_shipping_jpy": 3500.0,
+    "international_shipping_eur": 20.5,
+    "buyee_price_eur": 35.6,
+    "category": "trading_cards",
+    "notes": null,
+    "created_at": "2026-09-21T12:58:27.215688"
+  }
+]

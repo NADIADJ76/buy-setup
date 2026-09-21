@@ -102,6 +102,9 @@ class _HttpSessionAdapter:
 # still click the real element (via Playwright, a real browser) rather than
 # submitting the form ourselves, so that JS handler fires normally.
 BUYEE_LOGIN_URL = f"{BUYEE_BASE_URL}/signup/login"
+# CONFIRMED on 2026-09-21: the email-verification step Buyee shows after an
+# unrecognised login lands here.
+BUYEE_TWOFACTOR_URL = f"{BUYEE_BASE_URL}/signup/twoFactor"
 LOGIN_SELECTORS = {
     # Kept for backward compatibility / documentation; the actual login now
     # tries USERNAME_FIELD_CANDIDATES etc. below (confirmed selector first).
@@ -156,6 +159,18 @@ MAX_BAGGAGE_PAGES = 5
 class ScrapeResult:
     articles: list[Article] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # status distinguishes a real finished result ("done") from a request
+    # that needs a second step before it can finish ("code_required") --
+    # see the big comment above verify_and_fetch_invoices() below for why
+    # this two-phase flow exists at all. When status == "code_required",
+    # session_cookies/session_user_agent carry the PENDING (not yet fully
+    # authenticated) browser session that verify_and_fetch_invoices() must
+    # be given back later to actually enter the code -- these are held only
+    # in memory by the caller for the lifetime of one import job, same as
+    # BuyeeCredentials itself (see the privacy comment on that model).
+    status: str = "done"
+    session_cookies: list | None = None
+    session_user_agent: str | None = None
 
 
 def _parse_jpy(text: str | None) -> float:
@@ -467,21 +482,154 @@ def _describe_clickable_elements(html: str) -> str:
 CODE_BOX_INPUT_IDS = [f"input{i}" for i in range(1, 7)]
 
 
-def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeResult:
-    """Logs into Buyee and pulls recent shipped packages: article name,
-    photo, item price, Japan domestic shipping AND the real international
-    (Japan -> France) shipping fee Buyee already charged, for each line
-    item.
+def _fill_first_match(page, candidates: list[str], value: str) -> str | None:
+    for sel in candidates:
+        try:
+            page.fill(sel, value, timeout=FIELD_TRY_TIMEOUT_MS)
+            return sel
+        except Exception:  # noqa: BLE001 - just try the next candidate
+            continue
+    return None
 
-    Uses Scrapling's DynamicSession (a real, scriptable Chromium browser)
-    because Buyee's login form and account pages are JS-rendered, and
-    BeautifulSoup to parse the resulting HTML (Scrapling's own selector API
-    is fine for simple lookups, but this page's nested toggle panels and
-    label/value tables are much clearer to express with BeautifulSoup).
-    """
-    warnings: list[str] = []
-    articles: list[Article] = []
 
+def _click_first_match(page, candidates: list[str]) -> str | None:
+    """CONFIRMED BUG on 2026-09-21: clicking Buyee's login button triggers
+    an immediate navigation (to /signup/login or straight to
+    /signup/twoFactor), and Playwright's page.click() can raise "Execution
+    context was destroyed" when the page it's clicking on navigates away
+    before its own post-click bookkeeping finishes -- even though the click
+    itself worked perfectly. Without no_wait_after=True, that exception was
+    being swallowed by the except below and treated as "button not found".
+    no_wait_after=True makes the click return immediately instead of
+    waiting on the navigation it just triggered; the caller's own explicit
+    wait_for_load_state handles waiting for that navigation instead."""
+    for sel in candidates:
+        try:
+            page.click(sel, timeout=FIELD_TRY_TIMEOUT_MS, no_wait_after=True)
+            return sel
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _find_first_present(page, candidates: list[str]) -> str | None:
+    """Like _fill_first_match but read-only: just checks whether one of
+    these selectors exists on the page right now, without touching it."""
+    for sel in candidates:
+        try:
+            if page.query_selector(sel):
+                return sel
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _find_code_boxes(page) -> list[str]:
+    """CONFIRMED on 2026-09-21: Buyee's twoFactor page doesn't have one
+    code field -- it splits the 6-digit code into 6 separate
+    single-character boxes with ids input1..input6. Returns the ids that
+    are actually present right now, or an empty list."""
+    present = []
+    for box_id in CODE_BOX_INPUT_IDS:
+        try:
+            if page.query_selector(f"#{box_id}"):
+                present.append(box_id)
+        except Exception:  # noqa: BLE001
+            continue
+    return present
+
+
+def _capture_session(page, debug: dict) -> None:
+    """Grabs the current cookies + the real browser's user agent into
+    debug['cookies']/debug['user_agent'] so the caller can either resume
+    this exact session in a later, separate browser (see
+    verify_and_fetch_invoices) or use a plain, lightweight HTTP session for
+    the rest of the scrape instead of keeping the whole browser open."""
+    try:
+        debug["cookies"] = page.context.cookies()
+        debug["user_agent"] = page.evaluate("() => navigator.userAgent")
+    except Exception:  # noqa: BLE001
+        debug["cookies"] = []
+        debug["user_agent"] = None
+
+
+def _enter_verification_code(page, code_digits: str, debug: dict) -> None:
+    """Fills in Buyee's verification-code UI (single field OR the
+    CONFIRMED 6-separate-box layout) and submits it. Shared by phase 2
+    (verify_and_fetch_invoices) -- phase 1 never calls this since it never
+    has a code yet, it only needs to detect that a code UI showed up."""
+    verification_selector = _find_first_present(page, VERIFICATION_CODE_FIELD_CANDIDATES)
+    code_boxes = _find_code_boxes(page) if not verification_selector else []
+    if not verification_selector and not code_boxes:
+        debug["error"] = "champ_code_introuvable"
+        return
+    debug["verification_field_selector"] = (
+        verification_selector
+        if verification_selector
+        else f"#{code_boxes[0]}..#{code_boxes[-1]} (6 cases separees)"
+    )
+    if verification_selector:
+        page.fill(verification_selector, code_digits, timeout=FIELD_TRY_TIMEOUT_MS)
+    elif len(code_digits) < len(code_boxes):
+        debug["error"] = (
+            f"code_de_verification_incomplet ({len(code_digits)} chiffres recus, "
+            f"{len(code_boxes)} cases attendues)"
+        )
+        return
+    else:
+        # CONFIRMED BUG on 2026-09-21: page.fill() sets each box's value
+        # directly via JS and only fires "input"/"change" -- it does NOT
+        # fire real keydown/keypress/keyup events. A diagnostic dump of
+        # this page's buttons/links showed no plausible "validate the
+        # code" button at all -- just the cookie banner, Google Translate
+        # widget and language switcher -- which strongly suggests this is
+        # a 6-box OTP widget that auto-advances focus and auto-submits on
+        # the 6th real keystroke, the same way a phone's own OTP autofill
+        # UI works. page.fill() never triggers that JS. Using a real click
+        # + keyboard.type() per box fires proper key events instead.
+        for box_id, digit in zip(code_boxes, code_digits):
+            try:
+                page.click(f"#{box_id}", timeout=FIELD_TRY_TIMEOUT_MS)
+                page.keyboard.type(digit, delay=80)
+            except Exception:  # noqa: BLE001 - fall back to a direct
+                # value-set for this one box rather than aborting the
+                # whole code entry over one flaky box.
+                page.fill(f"#{box_id}", digit, timeout=FIELD_TRY_TIMEOUT_MS)
+        page.wait_for_timeout(800)
+        try:
+            page.keyboard.press("Enter")
+        except Exception:  # noqa: BLE001
+            pass
+        debug["verification_submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _login_phase1(username: str, password: str) -> dict:
+    """Phase 1 of login: username + password only. Returns a dict with
+    status in {"ok", "code_required", "error"}.
+
+    CONFIRMED on 2026-09-21, after several real attempts all failed
+    identically at the code-entry step no matter how the code was typed in
+    (a single fill(), a single field guess, the real 6-box layout with
+    fill(), the real 6-box layout with real keyboard.type() keystrokes):
+    Buyee issues a FRESH one-time code tied to each individual login
+    *attempt* (a new "connexion douteuse" email arrived on every single
+    try). A code from an earlier attempt's email can never be valid for a
+    brand-new attempt -- and the user can only ever learn a given attempt's
+    code from an email sent AFTER that attempt's username+password
+    submission, so there is no way to include a still-valid code in the
+    very first request that triggers its generation.
+
+    The fix is this two-phase design: phase 1 submits username+password,
+    and if Buyee shows the code page, captures that PENDING session's
+    cookies (status="code_required") instead of giving up. The caller (see
+    verify_and_fetch_invoices) can then resume that *exact* session in a
+    second, separate request once the user has the matching email in hand,
+    instead of starting a whole new login attempt (which would just
+    trigger yet another fresh code)."""
     try:
         from scrapling.fetchers import DynamicSession
     except ImportError as exc:  # pragma: no cover - dependency install issue
@@ -490,176 +638,51 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             "pip install \"scrapling[fetchers]\" && scrapling install"
         ) from exc
 
-    login_debug: dict = {
+    debug: dict = {
         "username_selector": None,
         "password_selector": None,
         "submit_selector": None,
         "verification_field_selector": None,
-        "verification_submit_selector": None,
         "cookies": None,
         "user_agent": None,
         "error": None,
     }
-
-    def _fill_first_match(page, candidates: list[str], value: str) -> str | None:
-        for sel in candidates:
-            try:
-                page.fill(sel, value, timeout=FIELD_TRY_TIMEOUT_MS)
-                return sel
-            except Exception:  # noqa: BLE001 - just try the next candidate
-                continue
-        return None
-
-    def _click_first_match(page, candidates: list[str]) -> str | None:
-        """CONFIRMED BUG on 2026-09-21: clicking Buyee's login button
-        triggers an immediate navigation (to /signup/login or straight to
-        /signup/twoFactor), and Playwright's page.click() can raise
-        "Execution context was destroyed" when the page it's clicking on
-        navigates away before its own post-click bookkeeping finishes --
-        even though the click itself worked perfectly. Without
-        no_wait_after=True, that exception was being swallowed by the
-        except below and treated as "button not found", which made the
-        code miss the two-factor page entirely (it looked like total
-        failure when login had actually succeeded). no_wait_after=True
-        makes the click return immediately instead of waiting on the
-        navigation it just triggered; the explicit wait_for_load_state
-        call right after this function's callers handles waiting for that
-        navigation instead."""
-        for sel in candidates:
-            try:
-                page.click(sel, timeout=FIELD_TRY_TIMEOUT_MS, no_wait_after=True)
-                return sel
-            except Exception:  # noqa: BLE001
-                continue
-        return None
-
-    def _find_first_present(page, candidates: list[str]) -> str | None:
-        """Like _fill_first_match but read-only: just checks whether one of
-        these selectors exists on the page right now, without touching it."""
-        for sel in candidates:
-            try:
-                if page.query_selector(sel):
-                    return sel
-            except Exception:  # noqa: BLE001
-                continue
-        return None
-
-    def _find_code_boxes(page) -> list[str]:
-        """CONFIRMED on 2026-09-21: Buyee's twoFactor page doesn't have one
-        code field -- it splits the 6-digit code into 6 separate
-        single-character boxes with ids input1..input6. Returns the ids
-        that are actually present right now, or an empty list."""
-        present = []
-        for box_id in CODE_BOX_INPUT_IDS:
-            try:
-                if page.query_selector(f"#{box_id}"):
-                    present.append(box_id)
-            except Exception:  # noqa: BLE001
-                continue
-        return present
-
-    def _capture_session(page) -> None:
-        """Grabs the logged-in cookies + the real browser's user agent so
-        the rest of the scrape can use a plain, lightweight HTTP session
-        instead of keeping the whole (memory-hungry) browser open."""
-        try:
-            login_debug["cookies"] = page.context.cookies()
-            login_debug["user_agent"] = page.evaluate("() => navigator.userAgent")
-        except Exception:  # noqa: BLE001
-            login_debug["cookies"] = []
-            login_debug["user_agent"] = None
+    warnings: list[str] = []
 
     def _do_login(page):
-        """Runs inside Scrapling's browser via page_action: receives the
-        real Playwright Page object to fill and submit the login form.
-        Tries several likely selectors quickly (a few seconds each) instead
-        of betting everything on one guess for 30s, and records which ones
-        worked (or that none did) in login_debug for the warnings below.
-        Also handles Buyee's optional email-verification-code step (see
-        VERIFICATION_CODE_FIELD_CANDIDATES above)."""
-        login_debug["username_selector"] = _fill_first_match(
-            page, USERNAME_FIELD_CANDIDATES, credentials.username
-        )
-        if not login_debug["username_selector"]:
-            login_debug["error"] = "champ identifiant introuvable"
+        debug["username_selector"] = _fill_first_match(page, USERNAME_FIELD_CANDIDATES, username)
+        if not debug["username_selector"]:
+            debug["error"] = "champ identifiant introuvable"
             return
-        login_debug["password_selector"] = _fill_first_match(
-            page, PASSWORD_FIELD_CANDIDATES, credentials.password
-        )
-        if not login_debug["password_selector"]:
-            login_debug["error"] = "champ mot de passe introuvable"
+        debug["password_selector"] = _fill_first_match(page, PASSWORD_FIELD_CANDIDATES, password)
+        if not debug["password_selector"]:
+            debug["error"] = "champ mot de passe introuvable"
             return
-        login_debug["submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
-        if not login_debug["submit_selector"]:
-            login_debug["error"] = "bouton de connexion introuvable"
+        debug["submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+        if not debug["submit_selector"]:
+            debug["error"] = "bouton de connexion introuvable"
             return
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:  # noqa: BLE001 - not fatal, we check the resulting page below anyway
+        except Exception:  # noqa: BLE001 - not fatal, checked via the resulting page below
             pass
 
         verification_selector = _find_first_present(page, VERIFICATION_CODE_FIELD_CANDIDATES)
         code_boxes = _find_code_boxes(page) if not verification_selector else []
         if verification_selector or code_boxes:
-            login_debug["verification_field_selector"] = (
+            debug["verification_field_selector"] = (
                 verification_selector
                 if verification_selector
                 else f"#{code_boxes[0]}..#{code_boxes[-1]} (6 cases separees)"
             )
-            if not credentials.verification_code:
-                login_debug["error"] = "code_de_verification_requis"
-                return
-            code_digits = "".join(ch for ch in credentials.verification_code if ch.isdigit())
-            if verification_selector:
-                page.fill(verification_selector, code_digits, timeout=FIELD_TRY_TIMEOUT_MS)
-            elif len(code_digits) < len(code_boxes):
-                login_debug["error"] = (
-                    f"code_de_verification_incomplet ({len(code_digits)} chiffres recus, "
-                    f"{len(code_boxes)} cases attendues)"
-                )
-                return
-            else:
-                # CONFIRMED BUG on 2026-09-21: page.fill() sets each box's
-                # value directly via JS and only fires "input"/"change" --
-                # it does NOT fire real keydown/keypress/keyup events. The
-                # diagnostic dump of this page's buttons/links (sent back
-                # to the user) showed no plausible "validate the code"
-                # button at all -- just the cookie banner, Google Translate
-                # widget and language switcher -- which strongly suggests
-                # this is a 6-box OTP widget that auto-advances focus and
-                # auto-submits on the 6th real keystroke, the same way a
-                # phone's own OTP autofill UI works. page.fill() never
-                # triggers that JS, so the code was silently never
-                # submitted at all. Using a real click + keyboard.type()
-                # per box fires proper key events, which this kind of
-                # widget listens for.
-                for box_id, digit in zip(code_boxes, code_digits):
-                    try:
-                        page.click(f"#{box_id}", timeout=FIELD_TRY_TIMEOUT_MS)
-                        page.keyboard.type(digit, delay=80)
-                    except Exception:  # noqa: BLE001 - fall back to a direct
-                        # value-set for this one box rather than aborting
-                        # the whole code entry over one flaky box.
-                        page.fill(f"#{box_id}", digit, timeout=FIELD_TRY_TIMEOUT_MS)
-                # Give any auto-advance/auto-submit JS triggered by that
-                # last keystroke a brief moment to run before we check.
-                page.wait_for_timeout(800)
-                # Fallback in case this widget needs an explicit submit
-                # instead of (or in addition to) auto-submitting: try
-                # Enter first (common for OTP forms), then any of our
-                # known button candidates (harmless no-op if neither
-                # exists / already submitted).
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:  # noqa: BLE001
-                    pass
-                login_debug["verification_submit_selector"] = _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:  # noqa: BLE001
-                pass
+            debug["error"] = "code_de_verification_requis"
+            # IMPORTANT: capture the PENDING session now, before returning --
+            # this is what verify_and_fetch_invoices needs later to resume
+            # this exact session once the user supplies the matching code.
+            _capture_session(page, debug)
+            return
 
-        _capture_session(page)
+        _capture_session(page, debug)
 
     # NOTE: Scrapling's StealthySession (a stealth/"patchright" browser that
     # can look more like a normal Chrome tab and push through Cloudflare)
@@ -682,111 +705,64 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
         login_result = session.fetch(BUYEE_LOGIN_URL, page_action=_do_login)
         warnings.append(
             f"[diagnostic] Selecteurs de connexion utilises : "
-            f"identifiant={login_debug['username_selector']!r}, "
-            f"mot_de_passe={login_debug['password_selector']!r}, "
-            f"bouton={login_debug['submit_selector']!r}"
+            f"identifiant={debug['username_selector']!r}, "
+            f"mot_de_passe={debug['password_selector']!r}, "
+            f"bouton={debug['submit_selector']!r}"
         )
         warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
-        if login_debug["verification_field_selector"]:
-            warnings.append(
-                f"[diagnostic] Code de verification : champ={login_debug['verification_field_selector']!r}, "
-                f"bouton={login_debug['verification_submit_selector']!r}"
-            )
-
-        if login_debug["error"] == "code_de_verification_requis":
-            warnings.append(
-                "Buyee demande un code de verification recu par email (verifie ta boite "
-                "mail, y compris les spams -- l'objet mentionne une 'connexion douteuse'). "
-                "Renseigne ce code dans le champ prevu et reessaie l'import ; tes "
-                "identifiants sont corrects, il ne manque que ce code."
-            )
-            return ScrapeResult(articles=[], warnings=warnings)
-
-        if login_debug["error"] and login_debug["error"].startswith("code_de_verification_incomplet"):
-            warnings.append(
-                f"Le code de verification saisi ne fait pas 6 chiffres ({login_debug['error']}). "
-                "Buyee attend un code a 6 chiffres recu par email -- reessaie en copiant le code "
-                "exact du dernier email 'connexion douteuse'."
-            )
-            return ScrapeResult(articles=[], warnings=warnings)
-
         login_url_after = str(login_result.url or "")
-        login_ok = not login_debug["error"] and _login_looks_successful(
-            str(login_result.html_content), login_url_after
+        html_after = str(login_result.html_content)
+
+    if debug["error"] == "code_de_verification_requis":
+        return {
+            "status": "code_required",
+            "cookies": debug.get("cookies") or [],
+            "user_agent": debug.get("user_agent"),
+            "warnings": warnings,
+        }
+
+    if debug["error"]:
+        warnings.append(
+            f"La connexion a Buyee a echoue avant meme d'envoyer le formulaire : "
+            f"{debug['error']}. Il faut ajuster les selecteurs de connexion dans "
+            f"buyee_scraper.py (USERNAME_FIELD_CANDIDATES / PASSWORD_FIELD_CANDIDATES / "
+            f"SUBMIT_BUTTON_CANDIDATES) -- envoie le HTML de "
+            f"https://buyee.jp/signup/login (deconnectee) pour que je trouve les bons."
         )
-        looks_like_verification_page = any(
-            token in login_url_after.lower()
-            for token in ("twofactor", "two_factor", "certification")
+        return {"status": "error", "warnings": warnings}
+
+    login_ok = _login_looks_successful(html_after, login_url_after)
+    if not login_ok:
+        warnings.append(
+            "La connexion a Buyee semble avoir echoue (toujours sur une page de "
+            "connexion apres l'envoi du formulaire) -- verifie tes identifiants, "
+            "ou envoie le HTML de https://buyee.jp/signup/login (deconnectee) pour "
+            "que je verifie les selecteurs."
         )
-        if login_debug["error"]:
-            warnings.append(
-                f"La connexion a Buyee a echoue avant meme d'envoyer le formulaire : "
-                f"{login_debug['error']}. Il faut ajuster les selecteurs de connexion "
-                f"dans buyee_scraper.py (USERNAME_FIELD_CANDIDATES / "
-                f"PASSWORD_FIELD_CANDIDATES / SUBMIT_BUTTON_CANDIDATES) -- envoie le HTML "
-                f"de https://buyee.jp/signup/login (deconnectee) pour que je trouve les bons."
-            )
-        elif not login_ok and looks_like_verification_page and not login_debug["verification_field_selector"]:
-            # On est bien arrive sur la page de code de verification (2FA)
-            # Buyee, mais aucun des VERIFICATION_CODE_FIELD_CANDIDATES ni le
-            # motif a 6 cases (CODE_BOX_INPUT_IDS) n'a ete trouve pendant
-            # _do_login -- donc le code (meme fourni) n'a jamais pu etre
-            # saisi. On liste tous les champs <input> visibles de cette page
-            # dans un warning pour identifier le vrai champ sans devoir
-            # re-uploader un fichier HTML.
-            warnings.append(
-                "Buyee a redirige vers sa page de code de verification (2FA), mais "
-                "aucun champ de saisie connu n'a ete trouve pour y entrer le code -- "
-                "il faut ajuster VERIFICATION_CODE_FIELD_CANDIDATES ou CODE_BOX_INPUT_IDS "
-                "dans buyee_scraper.py. Champs <input> visibles trouves sur cette page : "
-                f"{_describe_input_fields(str(login_result.html_content))}"
-            )
-        elif not login_ok and looks_like_verification_page:
-            # Le champ (ou les 6 cases) du code ONT ete trouves et remplis,
-            # et un clic sur SUBMIT_BUTTON_CANDIDATES a ete tente
-            # (verification_submit_selector), mais on est toujours sur la
-            # page de verification -- soit le code etait deja expire (Buyee
-            # en emet un nouveau a chaque tentative de connexion), soit ce
-            # clic n'a pas vise le vrai bouton de validation de cette page.
-            # On liste les boutons/liens presents pour trouver le bon.
-            warnings.append(
-                "Le code de verification a ete saisi mais Buyee est reste sur la page de "
-                "verification -- soit ce code est expire (Buyee en renvoie un nouveau a "
-                "chaque tentative : utilise le DERNIER email recu, pas un ancien), soit le "
-                f"bouton de validation utilise ({login_debug['verification_submit_selector']!r}) "
-                "n'etait pas le bon. Boutons/liens visibles sur cette page : "
-                f"{_describe_clickable_elements(str(login_result.html_content))}"
-            )
-        elif not login_ok:
-            warnings.append(
-                "La connexion a Buyee semble avoir echoue (toujours sur une page de "
-                "connexion apres l'envoi du formulaire) -- verifie tes identifiants, "
-                "ou envoie le HTML de https://buyee.jp/signup/login (deconnectee) pour "
-                "que je verifie les selecteurs."
-            )
+        return {"status": "error", "warnings": warnings}
 
-        if not login_ok:
-            # Don't burn several more minutes (and risk the request timing
-            # out entirely, which shows up in the app as a generic "Failed
-            # to fetch") trying to scrape a page we know we're not logged
-            # into.
-            return ScrapeResult(articles=[], warnings=warnings)
+    return {
+        "status": "ok",
+        "cookies": debug.get("cookies") or [],
+        "user_agent": debug.get("user_agent") or DEFAULT_USER_AGENT,
+        "warnings": warnings,
+    }
 
-        cookies = login_debug.get("cookies") or []
-        user_agent = login_debug.get("user_agent") or DEFAULT_USER_AGENT
-    # The browser used for login is now fully closed (we've left the `with`
-    # block), which is when most of the memory it used gets freed.
 
-    # --- Colis list: plain HTTP, no browser -----------------------------
-    # Confirmed against real saved HTML: the shipping-fee/delivery panels on
-    # this page are plain server-rendered HTML (values sit directly inside
-    # <td>/<dd> tags, no Knockout data-bind attribute on them) just visually
-    # hidden with CSS -- unlike the Fiche complete page below, no JavaScript
-    # needs to run for this data to be present, so a lightweight HTTP
-    # session (using the cookies captured during login) is enough. This is
-    # the fix for the OOM crashes: the real browser no longer has to stay
-    # open through the whole multi-page scrape, only for the login step and
-    # briefly per item below.
+def _scrape_with_session(
+    cookies: list, user_agent: str | None, max_items: int, extra_warnings: list[str] | None = None
+) -> ScrapeResult:
+    """The part of the scrape that runs once we already have an
+    authenticated session's cookies in hand: the Colis list over plain HTTP
+    (confirmed static, no browser needed) plus a fresh short-lived browser
+    per item's Fiche page (needs JS -- see
+    _fetch_item_details_fresh_browser's docstring for why a fresh one per
+    item instead of one long-lived session)."""
+    warnings = list(extra_warnings or [])
+    articles: list[Article] = []
+    user_agent = user_agent or DEFAULT_USER_AGENT
+    cookies = cookies or []
+
     http_session = requests.Session()
     for c in cookies:
         try:
@@ -824,12 +800,6 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
 
     raw_items = raw_items[:max_items]
 
-    # --- Fiche complete pages: one short-lived browser per item ----------
-    # This page IS Knockout.js-rendered (data-bind attributes on the price
-    # spans), so it does need a real browser with JavaScript -- but a fresh
-    # one per item, immediately closed afterwards, so memory never
-    # accumulates across items the way it did before (see
-    # _fetch_item_details_fresh_browser's docstring).
     for it in raw_items:
         details = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
         if it.get("fiche_url"):
@@ -858,6 +828,141 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
         )
 
     return ScrapeResult(articles=articles, warnings=warnings)
+
+
+def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeResult:
+    """Phase 1 entry point: logs into Buyee with username+password. If
+    Buyee accepts them outright (no 2FA challenge), goes straight on to
+    scrape the recent shipped packages. If Buyee shows its email
+    verification-code page instead, returns immediately with
+    status="code_required" and the PENDING session's cookies -- the caller
+    must then get the code from the user and call
+    verify_and_fetch_invoices() with those SAME cookies (see that
+    function's docstring for why a fresh fetch_invoices() call with a code
+    attached can never work)."""
+    phase1 = _login_phase1(credentials.username, credentials.password)
+
+    if phase1["status"] == "code_required":
+        phase1["warnings"].append(
+            "Buyee demande un code de verification recu par email (verifie ta boite "
+            "mail, y compris les spams -- l'objet mentionne une 'connexion douteuse'). "
+            "IMPORTANT : Buyee emet un code DIFFERENT a chaque tentative de connexion, "
+            "donc seul le code du DERNIER email recu (celui declenche par CET essai) "
+            "fonctionnera -- renseigne-le des que tu le recois."
+        )
+        return ScrapeResult(
+            articles=[],
+            warnings=phase1["warnings"],
+            status="code_required",
+            session_cookies=phase1["cookies"],
+            session_user_agent=phase1["user_agent"],
+        )
+
+    if phase1["status"] == "error":
+        return ScrapeResult(articles=[], warnings=phase1["warnings"])
+
+    return _scrape_with_session(
+        phase1["cookies"], phase1["user_agent"], max_items, extra_warnings=phase1["warnings"]
+    )
+
+
+def verify_and_fetch_invoices(
+    session_cookies: list,
+    session_user_agent: str | None,
+    verification_code: str,
+    max_items: int = 8,
+) -> ScrapeResult:
+    """Phase 2 entry point: resumes the PENDING 2FA session captured by a
+    previous fetch_invoices() call (status=="code_required", same
+    session_cookies) in a fresh browser seeded with those cookies, enters
+    the verification code, and -- if Buyee accepts it -- proceeds to the
+    normal scrape.
+
+    Must be called with the cookies from the SAME fetch_invoices() call
+    that asked for this code: Buyee ties each one-time code to the specific
+    login attempt that generated it (confirmed 2026-09-21 -- see
+    _login_phase1's docstring), so cookies from an older/different attempt
+    won't work even if the code itself is typed in correctly."""
+    try:
+        from scrapling.fetchers import DynamicSession
+    except ImportError as exc:  # pragma: no cover - dependency install issue
+        raise RuntimeError(
+            "Scrapling n'est pas installe correctement. Lance : "
+            "pip install \"scrapling[fetchers]\" && scrapling install"
+        ) from exc
+
+    debug: dict = {
+        "verification_field_selector": None,
+        "verification_submit_selector": None,
+        "cookies": None,
+        "user_agent": None,
+        "error": None,
+    }
+    warnings: list[str] = []
+    code_digits = "".join(ch for ch in (verification_code or "") if ch.isdigit())
+
+    def _do_verify(page):
+        _enter_verification_code(page, code_digits, debug)
+        _capture_session(page, debug)
+
+    with DynamicSession(
+        headless=True, network_idle=True, disable_resources=True, cookies=session_cookies or []
+    ) as session:
+        result = session.fetch(BUYEE_TWOFACTOR_URL, page_action=_do_verify)
+        warnings.append(f"[diagnostic] Apres validation du code : {_page_diagnostic(result)}")
+        if debug["verification_field_selector"]:
+            warnings.append(
+                f"[diagnostic] Code de verification : champ={debug['verification_field_selector']!r}, "
+                f"bouton={debug['verification_submit_selector']!r}"
+            )
+        url_after = str(result.url or "")
+        html_after = str(result.html_content)
+
+    def _still_pending(msg: str) -> ScrapeResult:
+        warnings.append(msg)
+        return ScrapeResult(
+            articles=[],
+            warnings=warnings,
+            status="code_required",
+            session_cookies=session_cookies,
+            session_user_agent=session_user_agent,
+        )
+
+    if debug["error"] == "champ_code_introuvable":
+        return _still_pending(
+            "Impossible de retrouver le champ du code sur la page de verification "
+            "(la session est peut-etre expiree -- Buyee peut fermer la fenetre de "
+            "validation au bout de quelques minutes). Reessaie l'import depuis le "
+            f"debut pour obtenir un nouveau code. Champs visibles : {_describe_input_fields(html_after)}"
+        )
+    if debug["error"] and debug["error"].startswith("code_de_verification_incomplet"):
+        return _still_pending(
+            f"Le code saisi ne fait pas 6 chiffres ({debug['error']}). Reessaie avec le "
+            "code exact recu par email."
+        )
+
+    login_ok = _login_looks_successful(html_after, url_after)
+    looks_like_verification_page = any(
+        token in url_after.lower() for token in ("twofactor", "two_factor", "certification")
+    )
+    if not login_ok and looks_like_verification_page:
+        return _still_pending(
+            "Le code de verification a ete saisi mais Buyee est reste sur la page de "
+            "verification -- soit ce code est incorrect ou deja expire (verifie que "
+            "c'est bien le DERNIER email recu, pas un ancien), soit le bouton de "
+            f"validation utilise ({debug.get('verification_submit_selector')!r}) n'etait "
+            f"pas le bon. Boutons/liens visibles : {_describe_clickable_elements(html_after)}"
+        )
+    if not login_ok:
+        warnings.append(
+            "La validation du code semble avoir echoue de facon inattendue -- reessaie "
+            "l'import depuis le debut pour obtenir un nouveau code."
+        )
+        return ScrapeResult(articles=[], warnings=warnings)
+
+    final_cookies = debug.get("cookies") or session_cookies or []
+    final_user_agent = debug.get("user_agent") or session_user_agent or DEFAULT_USER_AGENT
+    return _scrape_with_session(final_cookies, final_user_agent, max_items, extra_warnings=warnings)
 
 
 def fetch_invoices_demo() -> ScrapeResult:

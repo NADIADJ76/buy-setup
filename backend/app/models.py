@@ -11,16 +11,28 @@ from pydantic import BaseModel, Field
 class BuyeeCredentials(BaseModel):
     """Credentials are only ever held in memory for the duration of one
     scrape request. They are never written to disk, logged, or persisted
-    in any database/config file."""
+    in any database/config file.
+
+    CONFIRMED on 2026-09-21: Buyee issues a brand-new one-time
+    verification code by email on every single login attempt, so a code
+    can never be attached to this initial request -- it would always be
+    for an older attempt than the one being made right now. Login is a
+    two-phase protocol: this model starts phase 1 (username+password
+    only); if Buyee then asks for a code, phase 2 is a separate request
+    (see VerificationCodeSubmission below) that resumes that exact
+    pending session instead of logging in again."""
 
     username: str
     password: str
-    # Buyee peut demander un code de verification recu par email quand la
-    # connexion vient d'un appareil/IP qu'il ne reconnait pas (ce qui sera
-    # probablement toujours le cas depuis un serveur cloud). Laisse vide au
-    # premier essai ; si l'appli repond qu'un code est requis, relance
-    # l'import avec ce champ rempli.
-    verification_code: Optional[str] = None
+
+
+class VerificationCodeSubmission(BaseModel):
+    """Phase 2 of a Buyee import: submits the one-time code Buyee just
+    emailed for a pending login (job that came back with
+    status=="code_required"). The backend resumes that SAME session
+    server-side -- the client never sees or resends the session cookies."""
+
+    verification_code: str
 
 
 class Article(BaseModel):
