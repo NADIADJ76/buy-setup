@@ -451,9 +451,23 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
         return None
 
     def _click_first_match(page, candidates: list[str]) -> str | None:
+        """CONFIRMED BUG on 2026-09-21: clicking Buyee's login button
+        triggers an immediate navigation (to /signup/login or straight to
+        /signup/twoFactor), and Playwright's page.click() can raise
+        "Execution context was destroyed" when the page it's clicking on
+        navigates away before its own post-click bookkeeping finishes --
+        even though the click itself worked perfectly. Without
+        no_wait_after=True, that exception was being swallowed by the
+        except below and treated as "button not found", which made the
+        code miss the two-factor page entirely (it looked like total
+        failure when login had actually succeeded). no_wait_after=True
+        makes the click return immediately instead of waiting on the
+        navigation it just triggered; the explicit wait_for_load_state
+        call right after this function's callers handles waiting for that
+        navigation instead."""
         for sel in candidates:
             try:
-                page.click(sel, timeout=FIELD_TRY_TIMEOUT_MS)
+                page.click(sel, timeout=FIELD_TRY_TIMEOUT_MS, no_wait_after=True)
                 return sel
             except Exception:  # noqa: BLE001
                 continue
