@@ -294,3 +294,14 @@ def update_article(article_id: str, article: Article):
         raise HTTPException(status_code=400, detail="id mismatch")
     saved = storage.upsert_articles([article.model_dump(mode="json")])
     return next(a for a in saved if a["id"] == article_id)
+
+
+@router.delete("/{article_id}")
+def delete_article(article_id: str):
+    """Removes one article -- in particular, lets the user clear out the
+    sample articles loaded by 'Charger des donnees de demo' once real
+    Buyee imports are working, without them lingering forever alongside
+    real data."""
+    if not storage.delete_article(article_id):
+        raise HTTPException(status_code=404, detail="Article introuvable")
+    return {"deleted": article_id}

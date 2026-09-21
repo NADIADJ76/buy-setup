@@ -58,6 +58,17 @@ def get_article(article_id: str) -> dict | None:
     return None
 
 
+def delete_article(article_id: str) -> bool:
+    """Removes one article (e.g. a leftover 'Charger des donnees de demo'
+    sample the user wants to clear out). Returns True if it existed."""
+    existing = _read(ARTICLES_FILE)
+    remaining = [a for a in existing if a["id"] != article_id]
+    if len(remaining) == len(existing):
+        return False
+    _write(ARTICLES_FILE, remaining)
+    return True
+
+
 # --- Sales ----------------------------------------------------------------
 
 def list_sales() -> list[dict]:

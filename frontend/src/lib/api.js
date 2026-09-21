@@ -51,6 +51,7 @@ export const api = {
   listArticles: () => request('/invoices'),
   getArticle: (id) => request(`/invoices/${id}`),
   updateArticle: (id, article) => request(`/invoices/${id}`, { method: 'PUT', body: JSON.stringify(article) }),
+  deleteArticle: (id) => request(`/invoices/${id}`, { method: 'DELETE' }),
 
   costBreakdown: (inputs) => request('/pricing/breakdown', { method: 'POST', body: JSON.stringify(inputs) }),
   whatnotStrategy: (articleId, totalLandedCostEur, safetyMarginRate = 0.15) =>

@@ -54,7 +54,6 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
 from .models import Article, BuyeeCredentials
@@ -67,30 +66,6 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-
-
-class _SimpleResponse:
-    """Minimal stand-in for a Scrapling browser Response, built from a
-    plain requests.Response, so the same helpers below (_page_diagnostic,
-    the packages loop) work whether a page came from the real browser
-    (login) or from a lightweight HTTP GET (the Colis list -- see the
-    memory-usage comment in fetch_invoices for why)."""
-
-    def __init__(self, resp: requests.Response):
-        self.html_content = resp.text
-        self.url = resp.url
-
-
-class _HttpSessionAdapter:
-    """Wraps a plain requests.Session so it exposes the same .fetch(url)
-    interface as a Scrapling browser session."""
-
-    def __init__(self, http_session: requests.Session):
-        self._session = http_session
-
-    def fetch(self, url: str) -> _SimpleResponse:
-        resp = self._session.get(url, timeout=25)
-        return _SimpleResponse(resp)
 
 # --- Login: CONFIRMED against a real, logged-out Buyee login page
 # (https://buyee.jp/signup/login) on 2026-09-18. The form has id
@@ -753,50 +728,65 @@ def _scrape_with_session(
     cookies: list, user_agent: str | None, max_items: int, extra_warnings: list[str] | None = None
 ) -> ScrapeResult:
     """The part of the scrape that runs once we already have an
-    authenticated session's cookies in hand: the Colis list over plain HTTP
-    (confirmed static, no browser needed) plus a fresh short-lived browser
-    per item's Fiche page (needs JS -- see
+    authenticated session's cookies in hand: the Colis list, then a fresh
+    short-lived browser per item's Fiche page (needs JS -- see
     _fetch_item_details_fresh_browser's docstring for why a fresh one per
-    item instead of one long-lived session)."""
+    item instead of one long-lived session).
+
+    CONFIRMED BUG on 2026-09-21: the Colis list used to be fetched with a
+    plain requests.Session seeded with the login cookies (no JS engine),
+    on the assumption -- based on HTML samples exported from an
+    already-rendered page -- that the page was static. Against a real
+    account this found the package cards themselves
+    (<li class="luggageInfo">) but EVERY one of them was missing its
+    <table class="luggageInfo_order"> (confirmed via the app's own
+    warnings: 10 packages found, 10 "table introuvable ou vide" warnings,
+    0 articles extracted). Buyee evidently fills that table in via
+    JavaScript after the page's initial load, so only a real
+    (headless, JS-executing) browser -- same as the item Fiche pages
+    already use -- can see it. The list pages are few (capped by
+    MAX_BAGGAGE_PAGES below), so one browser is reused across all of them
+    rather than opening a fresh one per page."""
     warnings = list(extra_warnings or [])
     articles: list[Article] = []
     user_agent = user_agent or DEFAULT_USER_AGENT
     cookies = cookies or []
 
-    http_session = requests.Session()
-    for c in cookies:
-        try:
-            http_session.cookies.set(
-                c.get("name"), c.get("value"), domain=c.get("domain"), path=c.get("path", "/")
-            )
-        except Exception:  # noqa: BLE001
-            continue
-    http_session.headers.update({"User-Agent": user_agent, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
-    list_session = _HttpSessionAdapter(http_session)
-
     raw_items: list[dict] = []
-    page_num = 1
-    while len(raw_items) < max_items and page_num <= MAX_BAGGAGE_PAGES:
-        list_url = BUYEE_BAGGAGES_URL_TEMPLATE.format(page=page_num)
-        resp = list_session.fetch(list_url)
-        soup = BeautifulSoup(str(resp.html_content), "html.parser")
-        packages = soup.find_all("li", class_="luggageInfo")
-        if not packages:
-            if page_num == 1:
-                warnings.append(f"[diagnostic] Page colis : {_page_diagnostic(resp)}")
-                warnings.append(
-                    "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
-                    "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
-                    "encore en cours (pas encore expedies), ils n'apparaissent pas "
-                    "encore ici -- c'est normal, Buyee ne facture les frais de port "
-                    "internationaux qu'une fois le colis expedie."
-                )
-            break
-        for pkg in packages:
-            items, pkg_warnings = _parse_package(pkg)
-            warnings.extend(pkg_warnings)
-            raw_items.extend(items)
-        page_num += 1
+    try:
+        from scrapling.fetchers import DynamicSession
+
+        with DynamicSession(
+            headless=True, network_idle=True, disable_resources=True, cookies=cookies
+        ) as list_browser:
+            page_num = 1
+            while len(raw_items) < max_items and page_num <= MAX_BAGGAGE_PAGES:
+                list_url = BUYEE_BAGGAGES_URL_TEMPLATE.format(page=page_num)
+                resp = list_browser.fetch(list_url)
+                soup = BeautifulSoup(str(resp.html_content), "html.parser")
+                packages = soup.find_all("li", class_="luggageInfo")
+                if not packages:
+                    if page_num == 1:
+                        warnings.append(f"[diagnostic] Page colis : {_page_diagnostic(resp)}")
+                        warnings.append(
+                            "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
+                            "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
+                            "encore en cours (pas encore expedies), ils n'apparaissent pas "
+                            "encore ici -- c'est normal, Buyee ne facture les frais de port "
+                            "internationaux qu'une fois le colis expedie."
+                        )
+                    break
+                for pkg in packages:
+                    items, pkg_warnings = _parse_package(pkg)
+                    warnings.extend(pkg_warnings)
+                    raw_items.extend(items)
+                page_num += 1
+    except Exception as exc:  # noqa: BLE001 - one bad list fetch shouldn't crash the whole import
+        logger.warning("Echec du chargement de la liste des colis Buyee: %s", exc)
+        warnings.append(
+            f"Erreur pendant le chargement de la liste des colis Buyee "
+            f"({exc.__class__.__name__}: {exc})."
+        )
 
     raw_items = raw_items[:max_items]
 
