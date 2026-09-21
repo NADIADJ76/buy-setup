@@ -396,16 +396,44 @@ def _page_diagnostic(resp) -> str:
     return f"URL={url} | titre={title}"
 
 
-def _login_looks_successful(html: str) -> bool:
+def _login_looks_successful(html: str, url: str = "") -> bool:
     """Heuristic check that the login actually worked, so a bad selector or
     a wrong/expired password produces a clear warning instead of silently
-    trying to scrape a login page and finding nothing."""
+    trying to scrape a login page and finding nothing.
+
+    CONFIRMED BUG on 2026-09-21: this used to only check for the password
+    field being gone, which is ALSO true on Buyee's email-verification
+    ("twoFactor") page -- so a login that was actually still pending a
+    verification code was wrongly reported as successful, and the scrape
+    went on to hit the Colis page with an unauthenticated session (which
+    Buyee just redirects back to /signup/login, producing "aucun colis
+    trouve" instead of a clear "code needed" message)."""
+    if "twofactor" in url.lower() or "two_factor" in url.lower() or "certification" in url.lower():
+        return False
     soup = BeautifulSoup(html, "html.parser")
     if soup.select_one(LOGIN_SELECTORS["password_field"]):
         return False  # still looking at a login form
     if soup.find("a", href=re.compile(r"/mypage")):
         return True
     return True  # give the benefit of the doubt; the baggages page check below is authoritative
+
+
+def _describe_input_fields(html: str) -> str:
+    """Lists every <input>'s name/id/type/placeholder on a page -- used as
+    a diagnostic when we land on what looks like a verification/2FA page
+    but none of our guessed VERIFICATION_CODE_FIELD_CANDIDATES matched, so
+    the real field can be identified from the app's own warnings instead
+    of needing another saved-HTML upload."""
+    soup = BeautifulSoup(html, "html.parser")
+    fields = []
+    for inp in soup.find_all("input"):
+        if inp.get("type") == "hidden":
+            continue
+        fields.append(
+            f"(name={inp.get('name')!r} id={inp.get('id')!r} type={inp.get('type')!r} "
+            f"placeholder={inp.get('placeholder')!r})"
+        )
+    return "; ".join(fields) if fields else "(aucun champ input visible trouve)"
 
 
 def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeResult:
@@ -575,7 +603,14 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             )
             return ScrapeResult(articles=[], warnings=warnings)
 
-        login_ok = not login_debug["error"] and _login_looks_successful(str(login_result.html_content))
+        login_url_after = str(login_result.url or "")
+        login_ok = not login_debug["error"] and _login_looks_successful(
+            str(login_result.html_content), login_url_after
+        )
+        looks_like_verification_page = any(
+            token in login_url_after.lower()
+            for token in ("twofactor", "two_factor", "certification")
+        )
         if login_debug["error"]:
             warnings.append(
                 f"La connexion a Buyee a echoue avant meme d'envoyer le formulaire : "
@@ -583,6 +618,20 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 f"dans buyee_scraper.py (USERNAME_FIELD_CANDIDATES / "
                 f"PASSWORD_FIELD_CANDIDATES / SUBMIT_BUTTON_CANDIDATES) -- envoie le HTML "
                 f"de https://buyee.jp/signup/login (deconnectee) pour que je trouve les bons."
+            )
+        elif not login_ok and looks_like_verification_page:
+            # On est bien arrive sur la page de code de verification (2FA)
+            # Buyee, mais aucun des VERIFICATION_CODE_FIELD_CANDIDATES deja
+            # essayes n'a trouve le bon champ pendant _do_login -- donc le
+            # code (meme fourni) n'a jamais pu etre saisi. On liste tous les
+            # champs <input> visibles de cette page dans un warning pour
+            # identifier le vrai champ sans devoir re-uploader un fichier HTML.
+            warnings.append(
+                "Buyee a redirige vers sa page de code de verification (2FA), mais "
+                "aucun champ de saisie connu n'a ete trouve pour y entrer le code -- "
+                "il faut ajuster VERIFICATION_CODE_FIELD_CANDIDATES dans "
+                "buyee_scraper.py. Champs <input> visibles trouves sur cette page : "
+                f"{_describe_input_fields(str(login_result.html_content))}"
             )
         elif not login_ok:
             warnings.append(
