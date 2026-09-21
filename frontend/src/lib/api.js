@@ -18,8 +18,11 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  importInvoices: (username, password) =>
-    request('/invoices/import', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  importInvoices: (username, password, verificationCode) =>
+    request('/invoices/import', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, verification_code: verificationCode || null }),
+    }),
   importDemo: () => request('/invoices/demo', { method: 'POST' }),
   listArticles: () => request('/invoices'),
   getArticle: (id) => request(`/invoices/${id}`),

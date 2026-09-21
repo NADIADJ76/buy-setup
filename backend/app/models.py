@@ -15,6 +15,12 @@ class BuyeeCredentials(BaseModel):
 
     username: str
     password: str
+    # Buyee peut demander un code de verification recu par email quand la
+    # connexion vient d'un appareil/IP qu'il ne reconnait pas (ce qui sera
+    # probablement toujours le cas depuis un serveur cloud). Laisse vide au
+    # premier essai ; si l'appli repond qu'un code est requis, relance
+    # l'import avec ce champ rempli.
+    verification_code: Optional[str] = None
 
 
 class Article(BaseModel):

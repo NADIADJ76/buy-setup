@@ -5,6 +5,8 @@ import { api } from '../lib/api.js'
 export default function ImportPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [verificationCode, setVerificationCode] = useState('')
+  const [needsVerificationCode, setNeedsVerificationCode] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [warnings, setWarnings] = useState([])
@@ -16,10 +18,13 @@ export default function ImportPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await api.importInvoices(username, password)
-      setWarnings(res.warnings || [])
+      const res = await api.importInvoices(username, password, verificationCode)
+      const w = res.warnings || []
+      setWarnings(w)
       setImportedCount(res.articles?.length ?? 0)
-      setPassword('')
+      // Le backend explique en clair qu'un code de verification Buyee est
+      // necessaire -- on affiche alors le champ pour le saisir au prochain essai.
+      setNeedsVerificationCode(w.some((msg) => msg.toLowerCase().includes('code de verification')))
       if (res.articles?.length) navigate('/articles')
     } catch (err) {
       setError(err.message)
@@ -59,6 +64,16 @@ export default function ImportPage() {
           <input value={username} onChange={(e) => setUsername(e.target.value)} required />
           <label>Mot de passe Buyee</label>
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+          {needsVerificationCode && (
+            <>
+              <label>Code de verification Buyee (recu par email)</label>
+              <input
+                value={verificationCode}
+                onChange={(e) => setVerificationCode(e.target.value)}
+                placeholder="ex: 402010"
+              />
+            </>
+          )}
           <button type="submit" disabled={loading}>{loading ? 'Connexion...' : 'Importer mes factures'}</button>
           <button type="button" className="secondary" onClick={handleDemo} disabled={loading}>
             Charger des donnees de demo

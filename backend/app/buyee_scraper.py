@@ -54,6 +54,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup
 
 from .models import Article, BuyeeCredentials
@@ -62,6 +63,34 @@ from .storage import new_id
 logger = logging.getLogger("buyee_scraper")
 
 BUYEE_BASE_URL = "https://buyee.jp"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+class _SimpleResponse:
+    """Minimal stand-in for a Scrapling browser Response, built from a
+    plain requests.Response, so the same helpers below (_page_diagnostic,
+    the packages loop) work whether a page came from the real browser
+    (login) or from a lightweight HTTP GET (the Colis list -- see the
+    memory-usage comment in fetch_invoices for why)."""
+
+    def __init__(self, resp: requests.Response):
+        self.html_content = resp.text
+        self.url = resp.url
+
+
+class _HttpSessionAdapter:
+    """Wraps a plain requests.Session so it exposes the same .fetch(url)
+    interface as a Scrapling browser session."""
+
+    def __init__(self, http_session: requests.Session):
+        self._session = http_session
+
+    def fetch(self, url: str) -> _SimpleResponse:
+        resp = self._session.get(url, timeout=25)
+        return _SimpleResponse(resp)
 
 # --- Login: CONFIRMED against a real, logged-out Buyee login page
 # (https://buyee.jp/signup/login) on 2026-09-18. The form has id
@@ -98,6 +127,25 @@ SUBMIT_BUTTON_CANDIDATES = [
     "input[type='submit']",
 ]
 FIELD_TRY_TIMEOUT_MS = 4000
+
+# --- 2FA / email verification: Buyee can flag a login from an unrecognised
+# device or IP (confirmed on 2026-09-18: a real login attempt from this
+# app's cloud server triggered a "connexion douteuse" email with a 6-digit
+# code) and show a code-entry page instead of logging straight in. The
+# exact selector for that page is a best-effort guess (not yet confirmed
+# against real HTML, unlike the fields above) -- if it doesn't match,
+# `login_debug` below will report the page title/URL so it can be fixed
+# the same way the login fields were.
+VERIFICATION_CODE_FIELD_CANDIDATES = [
+    "input[name='certification_code']",
+    "input#certification_code",
+    "input[name='auth_code']",
+    "input[name='verify_code']",
+    "input[name='verification_code']",
+    "input[name*='code']",
+    "input[type='tel']",
+    "input[type='number']",
+]
 
 # --- "Colis expedies" list: CONFIRMED against a real account. ------------
 BUYEE_BAGGAGES_URL_TEMPLATE = BUYEE_BASE_URL + "/mybaggages/shipped/{page}"
@@ -273,18 +321,12 @@ def _parse_package(pkg_soup: BeautifulSoup) -> tuple[list[dict], list[str]]:
     return items, warnings
 
 
-def _fetch_item_details(session, fiche_url: str) -> dict:
-    """Visits one 'Fiche complete' order-detail page to get the photo and
-    the exact price actually billed for that item, plus Buyee's own
+def _parse_fiche_html(html: str, fiche_url: str) -> dict:
+    """Extracts the photo and the exact price actually billed for one item
+    from a 'Fiche complete' order-detail page's HTML, plus Buyee's own
     JPY->EUR conversion when the account has that feature enabled."""
     details: dict = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
-    try:
-        resp = session.fetch(fiche_url)
-    except Exception as exc:  # noqa: BLE001 - keep going, one bad item shouldn't fail the import
-        logger.warning("Echec du chargement de la fiche %s: %s", fiche_url, exc)
-        return details
-
-    soup = BeautifulSoup(str(resp.html_content), "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
     img = soup.select_one("div.itemCard__item img.g-thumbnail__image")
     if img and img.get("src"):
@@ -300,6 +342,44 @@ def _fetch_item_details(session, fiche_url: str) -> dict:
             details["buyee_price_eur"] = _parse_eur_from_text(fx_el.get_text(strip=True))
 
     return details
+
+
+def _fetch_item_details(session, fiche_url: str) -> dict:
+    """Visits one 'Fiche complete' order-detail page using an already-open
+    session (browser or HTTP adapter, both expose .fetch())."""
+    try:
+        resp = session.fetch(fiche_url)
+    except Exception as exc:  # noqa: BLE001 - keep going, one bad item shouldn't fail the import
+        logger.warning("Echec du chargement de la fiche %s: %s", fiche_url, exc)
+        return {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
+    return _parse_fiche_html(str(resp.html_content), fiche_url)
+
+
+def _fetch_item_details_fresh_browser(cookies: list, fiche_url: str) -> dict:
+    """Visits one 'Fiche complete' page in its OWN short-lived browser
+    session (a fresh Chromium process per item) instead of reusing one
+    long-lived session across every item. Render's own memory metrics
+    showed usage climbing with each successive page navigation inside a
+    single browser session until it exceeded the 512MB instance limit and
+    got OOM-killed mid-import (see the big comment in fetch_invoices) --
+    opening and fully closing a new browser per item means Chromium's
+    memory is handed back to the OS between items instead of accumulating.
+    Slower (every item pays a fresh browser-launch cost, roughly 1-3s) but
+    far less likely to get killed partway through."""
+    from scrapling.fetchers import DynamicSession
+
+    try:
+        with DynamicSession(
+            headless=True,
+            network_idle=True,
+            disable_resources=True,
+            cookies=cookies or [],
+        ) as fiche_browser:
+            resp = fiche_browser.fetch(fiche_url)
+            return _parse_fiche_html(str(resp.html_content), fiche_url)
+    except Exception as exc:  # noqa: BLE001 - one bad item shouldn't fail the whole import
+        logger.warning("Echec du chargement de la fiche %s: %s", fiche_url, exc)
+        return {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
 
 
 def _page_diagnostic(resp) -> str:
@@ -351,7 +431,15 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             "pip install \"scrapling[fetchers]\" && scrapling install"
         ) from exc
 
-    login_debug: dict = {"username_selector": None, "password_selector": None, "submit_selector": None, "error": None}
+    login_debug: dict = {
+        "username_selector": None,
+        "password_selector": None,
+        "submit_selector": None,
+        "verification_field_selector": None,
+        "cookies": None,
+        "user_agent": None,
+        "error": None,
+    }
 
     def _fill_first_match(page, candidates: list[str], value: str) -> str | None:
         for sel in candidates:
@@ -371,12 +459,36 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
                 continue
         return None
 
+    def _find_first_present(page, candidates: list[str]) -> str | None:
+        """Like _fill_first_match but read-only: just checks whether one of
+        these selectors exists on the page right now, without touching it."""
+        for sel in candidates:
+            try:
+                if page.query_selector(sel):
+                    return sel
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _capture_session(page) -> None:
+        """Grabs the logged-in cookies + the real browser's user agent so
+        the rest of the scrape can use a plain, lightweight HTTP session
+        instead of keeping the whole (memory-hungry) browser open."""
+        try:
+            login_debug["cookies"] = page.context.cookies()
+            login_debug["user_agent"] = page.evaluate("() => navigator.userAgent")
+        except Exception:  # noqa: BLE001
+            login_debug["cookies"] = []
+            login_debug["user_agent"] = None
+
     def _do_login(page):
         """Runs inside Scrapling's browser via page_action: receives the
         real Playwright Page object to fill and submit the login form.
         Tries several likely selectors quickly (a few seconds each) instead
         of betting everything on one guess for 30s, and records which ones
-        worked (or that none did) in login_debug for the warnings below."""
+        worked (or that none did) in login_debug for the warnings below.
+        Also handles Buyee's optional email-verification-code step (see
+        VERIFICATION_CODE_FIELD_CANDIDATES above)."""
         login_debug["username_selector"] = _fill_first_match(
             page, USERNAME_FIELD_CANDIDATES, credentials.username
         )
@@ -397,6 +509,21 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:  # noqa: BLE001 - not fatal, we check the resulting page below anyway
             pass
+
+        verification_selector = _find_first_present(page, VERIFICATION_CODE_FIELD_CANDIDATES)
+        if verification_selector:
+            login_debug["verification_field_selector"] = verification_selector
+            if not credentials.verification_code:
+                login_debug["error"] = "code_de_verification_requis"
+                return
+            page.fill(verification_selector, credentials.verification_code, timeout=FIELD_TRY_TIMEOUT_MS)
+            _click_first_match(page, SUBMIT_BUTTON_CANDIDATES)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:  # noqa: BLE001
+                pass
+
+        _capture_session(page)
 
     # NOTE: Scrapling's StealthySession (a stealth/"patchright" browser that
     # can look more like a normal Chrome tab and push through Cloudflare)
@@ -425,6 +552,15 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
         )
         warnings.append(f"[diagnostic] Apres connexion : {_page_diagnostic(login_result)}")
 
+        if login_debug["error"] == "code_de_verification_requis":
+            warnings.append(
+                "Buyee demande un code de verification recu par email (verifie ta boite "
+                "mail, y compris les spams -- l'objet mentionne une 'connexion douteuse'). "
+                "Renseigne ce code dans le champ prevu et reessaie l'import ; tes "
+                "identifiants sont corrects, il ne manque que ce code."
+            )
+            return ScrapeResult(articles=[], warnings=warnings)
+
         login_ok = not login_debug["error"] and _login_looks_successful(str(login_result.html_content))
         if login_debug["error"]:
             warnings.append(
@@ -449,52 +585,84 @@ def fetch_invoices(credentials: BuyeeCredentials, max_items: int = 8) -> ScrapeR
             # into.
             return ScrapeResult(articles=[], warnings=warnings)
 
-        raw_items: list[dict] = []
-        page_num = 1
-        while len(raw_items) < max_items and page_num <= MAX_BAGGAGE_PAGES:
-            list_url = BUYEE_BAGGAGES_URL_TEMPLATE.format(page=page_num)
-            resp = session.fetch(list_url)
-            soup = BeautifulSoup(str(resp.html_content), "html.parser")
-            packages = soup.find_all("li", class_="luggageInfo")
-            if not packages:
-                if page_num == 1:
-                    warnings.append(f"[diagnostic] Page colis : {_page_diagnostic(resp)}")
-                    warnings.append(
-                        "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
-                        "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
-                        "encore en cours (pas encore expedies), ils n'apparaissent pas "
-                        "encore ici -- c'est normal, Buyee ne facture les frais de port "
-                        "internationaux qu'une fois le colis expedie."
-                    )
-                break
-            for pkg in packages:
-                items, pkg_warnings = _parse_package(pkg)
-                warnings.extend(pkg_warnings)
-                raw_items.extend(items)
-            page_num += 1
+        cookies = login_debug.get("cookies") or []
+        user_agent = login_debug.get("user_agent") or DEFAULT_USER_AGENT
+    # The browser used for login is now fully closed (we've left the `with`
+    # block), which is when most of the memory it used gets freed.
 
-        raw_items = raw_items[:max_items]
-
-        for it in raw_items:
-            details = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
-            if it.get("fiche_url"):
-                details = _fetch_item_details(session, it["fiche_url"])
-
-            articles.append(
-                Article(
-                    id=new_id(),
-                    source_invoice_id=it.get("order_number") or it.get("item_id") or new_id(),
-                    name=it["name"],
-                    photo_url=details["photo_url"],
-                    item_price_jpy=details["item_price_jpy"] or 0.0,
-                    japan_domestic_shipping_jpy=it["japan_domestic_shipping_jpy"],
-                    international_shipping_jpy=it["international_shipping_jpy"],
-                    international_shipping_eur=(
-                        it["international_shipping_eur_buyee"]
-                    ),
-                    buyee_price_eur=details["buyee_price_eur"],
-                )
+    # --- Colis list: plain HTTP, no browser -----------------------------
+    # Confirmed against real saved HTML: the shipping-fee/delivery panels on
+    # this page are plain server-rendered HTML (values sit directly inside
+    # <td>/<dd> tags, no Knockout data-bind attribute on them) just visually
+    # hidden with CSS -- unlike the Fiche complete page below, no JavaScript
+    # needs to run for this data to be present, so a lightweight HTTP
+    # session (using the cookies captured during login) is enough. This is
+    # the fix for the OOM crashes: the real browser no longer has to stay
+    # open through the whole multi-page scrape, only for the login step and
+    # briefly per item below.
+    http_session = requests.Session()
+    for c in cookies:
+        try:
+            http_session.cookies.set(
+                c.get("name"), c.get("value"), domain=c.get("domain"), path=c.get("path", "/")
             )
+        except Exception:  # noqa: BLE001
+            continue
+    http_session.headers.update({"User-Agent": user_agent, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"})
+    list_session = _HttpSessionAdapter(http_session)
+
+    raw_items: list[dict] = []
+    page_num = 1
+    while len(raw_items) < max_items and page_num <= MAX_BAGGAGE_PAGES:
+        list_url = BUYEE_BAGGAGES_URL_TEMPLATE.format(page=page_num)
+        resp = list_session.fetch(list_url)
+        soup = BeautifulSoup(str(resp.html_content), "html.parser")
+        packages = soup.find_all("li", class_="luggageInfo")
+        if not packages:
+            if page_num == 1:
+                warnings.append(f"[diagnostic] Page colis : {_page_diagnostic(resp)}")
+                warnings.append(
+                    "Aucun colis trouve sur ta page 'Colis expedies' Buyee "
+                    "(https://buyee.jp/mybaggages/shipped/1). Si tu as des achats "
+                    "encore en cours (pas encore expedies), ils n'apparaissent pas "
+                    "encore ici -- c'est normal, Buyee ne facture les frais de port "
+                    "internationaux qu'une fois le colis expedie."
+                )
+            break
+        for pkg in packages:
+            items, pkg_warnings = _parse_package(pkg)
+            warnings.extend(pkg_warnings)
+            raw_items.extend(items)
+        page_num += 1
+
+    raw_items = raw_items[:max_items]
+
+    # --- Fiche complete pages: one short-lived browser per item ----------
+    # This page IS Knockout.js-rendered (data-bind attributes on the price
+    # spans), so it does need a real browser with JavaScript -- but a fresh
+    # one per item, immediately closed afterwards, so memory never
+    # accumulates across items the way it did before (see
+    # _fetch_item_details_fresh_browser's docstring).
+    for it in raw_items:
+        details = {"photo_url": None, "item_price_jpy": 0.0, "buyee_price_eur": None}
+        if it.get("fiche_url"):
+            details = _fetch_item_details_fresh_browser(cookies, it["fiche_url"])
+
+        articles.append(
+            Article(
+                id=new_id(),
+                source_invoice_id=it.get("order_number") or it.get("item_id") or new_id(),
+                name=it["name"],
+                photo_url=details["photo_url"],
+                item_price_jpy=details["item_price_jpy"] or 0.0,
+                japan_domestic_shipping_jpy=it["japan_domestic_shipping_jpy"],
+                international_shipping_jpy=it["international_shipping_jpy"],
+                international_shipping_eur=(
+                    it["international_shipping_eur_buyee"]
+                ),
+                buyee_price_eur=details["buyee_price_eur"],
+            )
+        )
 
     if not articles:
         warnings.append(
